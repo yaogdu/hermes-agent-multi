@@ -342,6 +342,7 @@ ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
         "profile",
         "queue",
         "restart",
+        "sessions",
         "status",
         "steer",
         "stop",
@@ -515,7 +516,6 @@ _TELEGRAM_MENU_PRIORITY = (
     "stop",
     "status",
     "resume",
-    "sessions",
     "model",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
