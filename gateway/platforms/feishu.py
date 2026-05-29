@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -2516,11 +2516,16 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
+        logger.debug(
+            "Card action: hermes_action=%r", hermes_action,
+        )
         update_prompt_action = (
             action_value.get("hermes_update_prompt_action")
             if isinstance(action_value, dict) else None
         )
 
+        if hermes_action and str(hermes_action).startswith("sessions_"):
+            return self._handle_sessions_card_action(event=event, action_value=action_value, loop=loop)
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
         if update_prompt_action:
@@ -2563,6 +2568,383 @@ class FeishuAdapter(BasePlatformAdapter):
         if not allowed_ids:
             return True
         return "*" in allowed_ids or normalized in allowed_ids
+
+    # ────────────────────────────────────────────────────────────────────
+    # /sessions interactive card
+    # ────────────────────────────────────────────────────────────────────
+
+    def _build_sessions_card(
+        self,
+        *,
+        sessions: List[Dict[str, Any]],
+        total: int,
+        page: int,
+        page_size: int,
+        owner_external_id: str,
+    ) -> Dict[str, Any]:
+        """Build a Feishu interactive card listing the user's sessions.
+
+        Each row carries a "继续" button whose value triggers resume on
+        click. Pagination is via prev/next buttons at the bottom; their
+        value carries the page number to render next.
+        """
+        max_page = max(0, (total - 1) // max(page_size, 1)) if total else 0
+        start = page * page_size
+
+        elements: List[Dict[str, Any]] = []
+        if not sessions:
+            elements.append({
+                "tag": "markdown",
+                "content": "你还没有任何历史 session。\n\n在飞书或其它平台和 Bot 聊一句话就会创建一个新 session。",
+            })
+        else:
+            for idx, s in enumerate(sessions, start=start + 1):
+                title = (s.get("title") or "").strip()
+                preview = (s.get("last_message_preview") or "").strip()
+                preview_role = s.get("last_message_role") or ""
+                agent_key = s.get("agent_key") or "main"
+                msg_count = s.get("message_count") or 0
+                cost = float(s.get("estimated_cost_usd") or 0)
+                last_at = s.get("last_message_at") or s.get("started_at") or ""
+                if isinstance(last_at, str) and len(last_at) >= 16:
+                    last_at = last_at[:16].replace("T", " ")
+                cost_str = f" · ${cost:.4f}" if cost else ""
+                sid = s.get("session_id", "")
+
+                # Prefer the title; otherwise fall back to a one-line preview
+                # of the last message. Cards on mobile are tight — keep <60ch.
+                if title:
+                    headline = title
+                    if len(headline) > 38:
+                        headline = headline[:35] + "…"
+                    body = f"`{agent_key}` · {msg_count} 条 · {last_at}{cost_str}"
+                else:
+                    role_label = {"user": "我", "assistant": "Bot"}.get(preview_role, "")
+                    preview_one_line = " ".join(preview.split())
+                    if len(preview_one_line) > 52:
+                        preview_one_line = preview_one_line[:50] + "…"
+                    if not preview_one_line:
+                        preview_one_line = "(空会话)"
+                    headline = f"{role_label}: {preview_one_line}" if role_label else preview_one_line
+                    body = f"`{agent_key}` · {msg_count} 条 · {last_at}{cost_str}"
+
+                elements.append({
+                    "tag": "div",
+                    "fields": [
+                        {
+                            "is_short": False,
+                            "text": {
+                                "tag": "lark_md",
+                                "content": f"**{idx}. {headline}**\n{body}",
+                            },
+                        },
+                    ],
+                    "extra": {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "继续"},
+                        "type": "primary",
+                        "value": {
+                            "hermes_action": "sessions_resume",
+                            "session_id": sid,
+                            "owner": owner_external_id,
+                        },
+                    },
+                })
+                elements.append({"tag": "hr"})
+
+        # Footer: page indicator + prev/next
+        page_label = f"第 {page + 1} / {max_page + 1} 页 · 共 {total} 个"
+        footer_buttons: List[Dict[str, Any]] = []
+        if page > 0:
+            footer_buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "← 上一页"},
+                "type": "default",
+                "value": {
+                    "hermes_action": "sessions_page",
+                    "page": page - 1,
+                    "owner": owner_external_id,
+                },
+            })
+        if page < max_page:
+            footer_buttons.append({
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "下一页 →"},
+                "type": "default",
+                "value": {
+                    "hermes_action": "sessions_page",
+                    "page": page + 1,
+                    "owner": owner_external_id,
+                },
+            })
+
+        elements.append({
+            "tag": "note",
+            "elements": [{"tag": "plain_text", "content": page_label}],
+        })
+        if footer_buttons:
+            elements.append({"tag": "action", "actions": footer_buttons})
+
+        return {
+            "config": {"wide_screen_mode": True, "update_multi": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": "📋 我的历史 sessions"},
+                "template": "blue",
+            },
+            "elements": elements,
+        }
+
+    async def send_my_sessions_card(
+        self,
+        *,
+        chat_id: str,
+        owner_external_id: str,
+        page: int = 0,
+        page_size: int = 5,
+    ) -> SendResult:
+        """Fetch the user's cross-platform sessions and render the card."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from gateway.cross_platform_sessions import list_my_sessions, count_my_sessions
+            from gateway.session import Platform as _Platform
+            state_db = self._hermes_state_db_path()
+            sessions = list_my_sessions(
+                state_db_path=state_db,
+                platform=_Platform.FEISHU,
+                external_id=owner_external_id,
+                limit=page_size,
+                offset=page * page_size,
+            )
+            total = count_my_sessions(
+                state_db_path=state_db,
+                platform=_Platform.FEISHU,
+                external_id=owner_external_id,
+            )
+        except Exception as exc:
+            logger.debug("[Feishu] sessions card fetch failed: %s", exc, exc_info=True)
+            sessions, total = [], 0
+
+        card = self._build_sessions_card(
+            sessions=sessions,
+            total=total,
+            page=page,
+            page_size=page_size,
+            owner_external_id=owner_external_id,
+        )
+        try:
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=None,
+                metadata=None,
+            )
+            return self._finalize_send_result(response, "send_my_sessions_card failed")
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    def _hermes_state_db_path(self) -> Path:
+        """Path to Hermes' state.db — shared between this gateway and the
+        Control Panel.
+
+        Honor the HERMES_HOME env var first (Docker sets it to /opt/data,
+        which is where state.db actually lives). Fall back to the CLI
+        config helper, then to ~/.hermes.
+        """
+        import os as _os
+        env_home = _os.getenv("HERMES_HOME", "").strip()
+        if env_home:
+            return Path(env_home) / "state.db"
+        try:
+            from hermes_cli import config as _cli_config
+            return Path(_cli_config.get_home_dir()) / "state.db"
+        except Exception:
+            return Path.home() / ".hermes" / "state.db"
+
+    def _handle_sessions_card_action(
+        self, *, event: Any, action_value: Dict[str, Any], loop: Any,
+    ) -> Any:
+        """Route /sessions card button clicks (resume / page).
+
+        For pagination we update the *same* card in-place by returning a
+        new card payload in the callback response (the Lark SDK passes
+        ``response.card`` back to Feishu which swaps the rendered card).
+        Without this every page click would post a fresh card and clutter
+        the chat.
+        """
+        action_name = str(action_value.get("hermes_action") or "")
+        operator = getattr(event, "operator", None)
+        operator_open_id = str(getattr(operator, "open_id", "") or "")
+        operator_union_id = str(getattr(operator, "union_id", "") or "") or None
+        operator_user_id = str(getattr(operator, "user_id", "") or "") or None
+
+        context = getattr(event, "context", None)
+        chat_id = str(getattr(context, "open_chat_id", "") or "")
+        if not chat_id:
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        owner = str(action_value.get("owner") or "") or (
+            operator_union_id or operator_user_id or operator_open_id
+        )
+
+        if action_name == "sessions_page":
+            page = int(action_value.get("page") or 0)
+            # Always use toast + async fresh-card send. In-place CallBackCard
+            # updates are unreliable across Feishu SDK versions and connection
+            # states — a new card via the message API arrives as a distinct
+            # message but works every time.
+            ok = self._submit_on_loop(
+                loop,
+                self.send_my_sessions_card(
+                    chat_id=chat_id, owner_external_id=owner, page=page,
+                ),
+            )
+            if not ok:
+                logger.warning("[Feishu] sessions_page: failed to schedule card send")
+            if P2CardActionTriggerResponse:
+                response = P2CardActionTriggerResponse()
+                response.toast = {"type": "info", "content": "加载中…"}
+                return response
+        elif action_name == "sessions_resume":
+            session_id = str(action_value.get("session_id") or "")
+            if session_id:
+                ok = self._submit_on_loop(
+                    loop,
+                    self._resume_session_via_card(
+                        chat_id=chat_id,
+                        sender_id=SimpleNamespace(
+                            open_id=operator_open_id,
+                            user_id=operator_user_id,
+                            union_id=operator_union_id,
+                        ),
+                        target_session_id=session_id,
+                    ),
+                )
+                if not ok:
+                    logger.warning("[Feishu] sessions_resume: failed to schedule resume")
+                if P2CardActionTriggerResponse:
+                    response = P2CardActionTriggerResponse()
+                    response.toast = {"type": "info", "content": "正在切换到该会话..."}
+                    return response
+
+        return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+    async def _resume_session_via_card(
+        self,
+        *,
+        chat_id: str,
+        sender_id: Any,
+        target_session_id: str,
+    ) -> None:
+        """Resume the target session and send a confirmation back to chat.
+
+        Uses session_store.switch_session directly (the same primitive that
+        /resume calls under the hood). We send our own confirmation message
+        because there's no inbound message to reply to.
+        """
+        try:
+            sender_profile = await self._resolve_sender_profile(sender_id)
+            chat_info = await self.get_chat_info(chat_id)
+            source = self.build_source(
+                chat_id=chat_id,
+                chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+                chat_type=self._resolve_source_chat_type(
+                    chat_info=chat_info, event_chat_type="p2p",
+                ),
+                user_id=sender_profile["user_id"],
+                user_name=sender_profile["user_name"],
+                thread_id=None,
+                user_id_alt=sender_profile["user_id_alt"],
+                user_metadata=sender_profile.get("user_metadata"),
+            )
+
+            # Base adapter exposes the session store via
+            # set_session_store(); it lives at `self._session_store`. The
+            # store carries its underlying SessionDB so we can also look
+            # up titles for the confirmation message.
+            session_store = getattr(self, "_session_store", None)
+            session_db = getattr(session_store, "_db", None) if session_store else None
+            if session_store is None:
+                logger.warning("[Feishu] Cannot resume: session_store unavailable")
+                await self.send(
+                    chat_id=chat_id,
+                    content="切换 session 失败：session store 不可用。",
+                )
+                return
+
+            # Follow the compression chain like /resume does.
+            effective_target = target_session_id
+            try:
+                if session_db is not None:
+                    effective_target = session_db.resolve_resume_session_id(target_session_id)
+            except Exception:
+                logger.debug("resolve_resume_session_id failed", exc_info=True)
+
+            # session_key is what session_store uses internally.
+            from gateway.session import build_session_key
+            session_key = build_session_key(source)
+
+            new_entry = session_store.switch_session(session_key, effective_target)
+            if new_entry is None:
+                await self.send(
+                    chat_id=chat_id,
+                    content="切换 session 失败：会话不存在或已被关闭。",
+                )
+                return
+
+            # Pull title for the confirmation message.
+            title = ""
+            try:
+                if session_db is not None:
+                    title = session_db.get_session_title(effective_target) or ""
+            except Exception:
+                pass
+            label = title or effective_target
+
+            # Recap so the user sees the last few exchanges right away.
+            recap = ""
+            try:
+                history = session_store.load_transcript(effective_target)
+                if history:
+                    chat_turns = [
+                        {"role": (m.get("role") or "").lower(), "content": (m.get("content") or "").strip()}
+                        for m in history
+                    ]
+                    chat_turns = [
+                        t for t in chat_turns
+                        if t["role"] in ("user", "assistant") and t["content"]
+                    ]
+                    if chat_turns:
+                        tail = chat_turns[-6:]  # max 3 pairs
+                        lines = ["📜 **最近对话回顾**"]
+                        for turn in tail:
+                            label = "你" if turn["role"] == "user" else "Bot"
+                            text = " ".join(turn["content"].split())
+                            if len(text) > 140:
+                                text = text[:137] + "…"
+                            lines.append(f"**{label}:** {text}")
+                        recap = "\n".join(lines)
+            except Exception:
+                logger.debug("recap render failed", exc_info=True)
+
+            confirm = (
+                f"↻ 已切回 session **{label}**\n"
+                f"接下来在本对话发消息会回到这个上下文。"
+            )
+            if recap:
+                confirm = f"{confirm}\n\n{recap}"
+            await self.send(chat_id=chat_id, content=confirm)
+        except Exception:
+            logger.exception("[Feishu] _resume_session_via_card crashed")
+            try:
+                await self.send(
+                    chat_id=chat_id,
+                    content="切换 session 失败。",
+                )
+            except Exception:
+                pass
 
     def _handle_approval_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
         """Schedule approval resolution and build the synchronous callback response."""
@@ -2756,6 +3138,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            user_metadata=sender_profile.get("user_metadata"),
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -2818,6 +3201,7 @@ class FeishuAdapter(BasePlatformAdapter):
             user_name=sender_profile["user_name"],
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
+            user_metadata=sender_profile.get("user_metadata"),
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -3067,6 +3451,9 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
+        # Note: group-ownership rewriting is handled in base.build_source —
+        # see gateway/platforms/base.py. All platform adapters get the same
+        # behavior for free; this site just passes the raw sender info.
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -3076,6 +3463,7 @@ class FeishuAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
+            user_metadata=sender_profile.get("user_metadata"),
         )
         normalized = MessageEvent(
             text=text,
@@ -3810,32 +4198,54 @@ class FeishuAdapter(BasePlatformAdapter):
         sender_id: Any,
         *,
         is_bot: bool = False,
-    ) -> Dict[str, Optional[str]]:
+    ) -> Dict[str, Any]:
         """Map Feishu's three-tier user IDs onto Hermes' SessionSource fields.
 
         Preference order for the primary ``user_id`` field:
-          1. user_id  (tenant-scoped, most stable — requires permission scope)
-          2. open_id  (app-scoped, always available — different per bot app)
+          1. union_id (developer-scoped, most stable across apps)
+          2. user_id  (tenant-scoped — requires contact:user.base:readonly scope)
+          3. open_id  (app-scoped, always available — different per bot app)
 
-        ``user_id_alt`` carries the union_id (developer-scoped, stable across
-        all apps by the same developer).  Session-key generation prefers
-        user_id_alt when present, so participant isolation stays stable even
-        if the primary ID is the app-scoped open_id.
+        ``user_id_alt`` carries the union_id for session-key stability, so
+        participant isolation stays stable even when the primary ID is the
+        app-scoped open_id.
+
+        Returns a dict with ``user_id``, ``user_name``, ``user_id_alt``, and
+        ``user_metadata`` (a small dict of platform-specific profile bits —
+        email/mobile/employee_no/dept_ids — for the Control Panel admin to
+        identify the human behind the open_id).
         """
         open_id = getattr(sender_id, "open_id", None) or None
-        user_id = getattr(sender_id, "user_id", None) or None
+        user_id_val = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
-        # Prefer tenant-scoped user_id; fall back to app-scoped open_id.
-        primary_id = user_id or open_id
+        # Choose the most stable ID available as the canonical identity:
+        #   union_id (developer-scoped, never changes across apps) >
+        #   user_id  (tenant-scoped, stable within the company) >
+        #   open_id  (app-scoped, changes if the bot is re-registered).
+        # This is what gets written to sessions.user_id AND to
+        # user_identities.external_id, so the two always agree and the
+        # Control Panel can always trace "this session belongs to this
+        # human" without needing alias tables.
+        primary_id = union_id or user_id_val or open_id
         # bot/v3/bots/basic_batch only accepts open_id.
-        name_lookup_id = open_id if is_bot else (primary_id or union_id)
-        display_name = await self._resolve_sender_name_from_api(
-            name_lookup_id, is_bot=is_bot,
-        )
+        name_lookup_id = open_id if is_bot else (primary_id or open_id)
+        # Fetch both name and the full profile in one API roundtrip when
+        # possible. Bots only have a name (no contact info).
+        if is_bot:
+            display_name = await self._resolve_sender_name_from_api(
+                name_lookup_id, is_bot=True,
+            )
+            user_metadata: Dict[str, Any] = {}
+        else:
+            display_name, user_metadata = await self._resolve_sender_full_profile(
+                name_lookup_id,
+            )
+
         return {
             "user_id": primary_id,
             "user_name": display_name,
             "user_id_alt": union_id,
+            "user_metadata": user_metadata,
         }
 
     def _get_cached_sender_name(self, sender_id: Optional[str]) -> Optional[str]:
@@ -3849,6 +4259,146 @@ class FeishuAdapter(BasePlatformAdapter):
         if time.time() < expire_at:
             return name
         self._sender_name_cache.pop(sender_id, None)
+        return None
+
+    async def _resolve_sender_full_profile(
+        self,
+        sender_id: Optional[str],
+    ) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Like _resolve_sender_name_from_api, but also extracts contact info.
+
+        Returns (display_name, metadata) where metadata holds whichever of
+        these the Feishu app has permission to read:
+          - email
+          - mobile (visible if contact:user.phone:readonly granted)
+          - employee_no
+          - dept_ids (list)
+
+        Permission failures are surfaced via ``metadata["_permission_hint"]``
+        so the Control Panel admin sees why a field is missing instead of
+        guessing. Other failures are silent — the gateway must never block
+        on contact API.
+
+        Caches name (only) with the same TTL as the name-only path so we
+        don't double-hit the API.
+        """
+        if not sender_id or not self._client:
+            return None, {}
+        trimmed = sender_id.strip()
+        if not trimmed:
+            return None, {}
+        # Skip the contact API entirely if we already have this identity on
+        # file with usable info. Saves a Lark API call on every session create.
+        try:
+            from gateway.group_owner_resolver import is_identity_fresh
+            if is_identity_fresh(platform="feishu", external_id=trimmed):
+                cached_name = self._get_cached_sender_name(trimmed)
+                return (cached_name or None), {}
+        except Exception:
+            pass
+        # Name cache reduces API calls; metadata is also derived from the
+        # same response, so cache-hit returns name + empty metadata (we
+        # already wrote it the first time around).
+        cached_name = self._get_cached_sender_name(trimmed)
+        if cached_name is not None:
+            return (cached_name or None), {}
+        try:
+            from lark_oapi.api.contact.v3 import GetUserRequest  # lazy import
+            if trimmed.startswith("ou_"):
+                id_type = "open_id"
+            elif trimmed.startswith("on_"):
+                id_type = "union_id"
+            else:
+                id_type = "user_id"
+            request = GetUserRequest.builder().user_id(trimmed).user_id_type(id_type).build()
+            response = await asyncio.to_thread(self._client.contact.v3.user.get, request)
+            if not response:
+                return None, {}
+            if not response.success():
+                # Lark SDK exposes code/msg on failed responses. The common
+                # ones we want admins to see:
+                #   99991663  → 应用未申请权限 ("missing permission scope")
+                #   99991668  → 应用未发布或未审批
+                #   99991401  → app token / tenant token 失效
+                # We don't want to swallow these — surface them through
+                # metadata so the panel admin knows to fix the app config.
+                code = getattr(response, "code", None)
+                msg = getattr(response, "msg", "") or ""
+                logger.warning(
+                    "[Feishu] contact.v3.user.get failed for %s: code=%s msg=%s",
+                    sender_id, code, msg,
+                )
+                hint = self._permission_hint_for_lark_code(code, msg)
+                return None, ({"_permission_hint": hint} if hint else {})
+            user = getattr(getattr(response, "data", None), "user", None)
+            if user is None:
+                return None, {}
+            name = (
+                getattr(user, "name", None)
+                or getattr(user, "display_name", None)
+                or getattr(user, "nickname", None)
+                or getattr(user, "en_name", None)
+            )
+            display_name: Optional[str] = None
+            if name and isinstance(name, str):
+                stripped = name.strip()
+                if stripped:
+                    display_name = stripped
+                    self._sender_name_cache[trimmed] = (
+                        stripped, time.time() + _FEISHU_SENDER_NAME_TTL_SECONDS,
+                    )
+            # Extract contact bits. Each attribute is permission-gated on the
+            # Feishu side; missing values just stay out of the metadata dict.
+            metadata: Dict[str, Any] = {}
+            for attr in ("email", "mobile", "mobile_visible", "employee_no",
+                         "job_title", "en_name", "nickname"):
+                value = getattr(user, attr, None)
+                if value and isinstance(value, str) and value.strip():
+                    metadata[attr] = value.strip()
+            # department_ids comes through as a list
+            dept_ids = getattr(user, "department_ids", None)
+            if isinstance(dept_ids, list) and dept_ids:
+                metadata["department_ids"] = [str(d) for d in dept_ids if d]
+            # Field-level permission hints: if name came back but email/mobile
+            # didn't, the app probably lacks the contact:user.email/.phone
+            # scopes. Surface a single-line hint admin can act on.
+            missing_fields = []
+            if not metadata.get("email"):
+                missing_fields.append("email")
+            if not metadata.get("mobile"):
+                missing_fields.append("mobile")
+            if missing_fields:
+                metadata["_permission_hint"] = (
+                    f"飞书应用缺少 {', '.join(missing_fields)} 权限作用域。"
+                    f"在飞书开放平台为该应用申请 "
+                    f"contact:user.base:readonly + contact:user.email:readonly + "
+                    f"contact:user.phone:readonly。"
+                )
+            return display_name, metadata
+        except Exception:
+            logger.debug(
+                "[Feishu] Failed to resolve sender profile for %s", sender_id,
+                exc_info=True,
+            )
+            return None, {}
+
+    @staticmethod
+    def _permission_hint_for_lark_code(code: Any, msg: str) -> Optional[str]:
+        """Map common Lark error codes to admin-friendly Chinese hints."""
+        try:
+            code_int = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code_int = None
+        if code_int == 99991663:
+            return "飞书应用未申请 contact:user.base:readonly 权限作用域 — 去开放平台为该应用申请并发布版本。"
+        if code_int == 99991668:
+            return "飞书应用未发布或未通过审批 — 在开放平台 → 版本管理与发布 提交版本。"
+        if code_int == 99991401:
+            return "飞书 access token 失效 — 检查 app_id/app_secret 是否正确，或重启 gateway 重新换 token。"
+        if code_int in (1254040, 1254041):
+            return "飞书用户不属于本企业 — 该 open_id/user_id 不在 contact 范围内（如外部联系人/匿名用户）。"
+        if code_int is not None:
+            return f"飞书 API 错误（code={code_int}）：{msg or '查看 hermes 日志获取详情'}。"
         return None
 
     async def _resolve_sender_name_from_api(
