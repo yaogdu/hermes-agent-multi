@@ -2768,11 +2768,13 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> Any:
         """Route /sessions card button clicks (resume / page).
 
-        For pagination we update the *same* card in-place by returning a
-        new card payload in the callback response (the Lark SDK passes
-        ``response.card`` back to Feishu which swaps the rendered card).
-        Without this every page click would post a fresh card and clutter
-        the chat.
+        Pagination is handled **synchronously**: the DB query runs on the
+        SDK callback thread (SQLite WAL reads are lock-free) and the card
+        is returned in-place via ``CallBackCard``. No async scheduling, no
+        new message — the same card is replaced instantly.
+
+        Resume is async (API calls + session switching) and returns a toast
+        while the work is scheduled on the event loop.
         """
         action_name = str(action_value.get("hermes_action") or "")
         operator = getattr(event, "operator", None)
@@ -2791,23 +2793,51 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if action_name == "sessions_page":
             page = int(action_value.get("page") or 0)
-            # Always use toast + async fresh-card send. In-place CallBackCard
-            # updates are unreliable across Feishu SDK versions and connection
-            # states — a new card via the message API arrives as a distinct
-            # message but works every time.
-            ok = self._submit_on_loop(
-                loop,
-                self.send_my_sessions_card(
-                    chat_id=chat_id, owner_external_id=owner, page=page,
-                ),
+            page_size = 5
+            # Synchronous DB read — fast enough for a card callback.
+            # SQLite WAL reads don't block writes, so this is safe even
+            # while the agent loop is busy.
+            try:
+                from gateway.cross_platform_sessions import list_my_sessions, count_my_sessions
+                from gateway.session import Platform as _Platform
+                state_db = self._hermes_state_db_path()
+                sessions = list_my_sessions(
+                    state_db_path=state_db,
+                    platform=_Platform.FEISHU,
+                    external_id=owner,
+                    limit=page_size,
+                    offset=page * page_size,
+                )
+                total = count_my_sessions(
+                    state_db_path=state_db,
+                    platform=_Platform.FEISHU,
+                    external_id=owner,
+                )
+            except Exception:
+                logger.debug("sessions_page: db query failed", exc_info=True)
+                if P2CardActionTriggerResponse:
+                    resp = P2CardActionTriggerResponse()
+                    resp.toast = {"type": "error", "content": "查询失败，请重试"}
+                    return resp
+                return None
+
+            next_card = self._build_sessions_card(
+                sessions=sessions,
+                total=total,
+                page=page,
+                page_size=page_size,
+                owner_external_id=owner,
             )
-            if not ok:
-                logger.warning("[Feishu] sessions_page: failed to schedule card send")
-            if P2CardActionTriggerResponse:
-                response = P2CardActionTriggerResponse()
-                response.toast = {"type": "info", "content": "加载中…"}
-                return response
-        elif action_name == "sessions_resume":
+            if P2CardActionTriggerResponse and CallBackCard:
+                resp = P2CardActionTriggerResponse()
+                card = CallBackCard()
+                card.type = "raw"
+                card.data = next_card
+                resp.card = card
+                return resp
+            return None
+
+        if action_name == "sessions_resume":
             session_id = str(action_value.get("session_id") or "")
             if session_id:
                 ok = self._submit_on_loop(
