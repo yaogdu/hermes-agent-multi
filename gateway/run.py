@@ -2360,6 +2360,9 @@ class GatewayRunner:
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
+        role_overrides = self._read_role_model_overrides(user_config, source)
+        if role_overrides.get("model"):
+            model = str(role_overrides["model"])
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
         if override:
             override_model = override.get("model", model)
@@ -2398,6 +2401,31 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
+        if role_overrides.get("provider"):
+            role_provider = str(role_overrides["provider"])
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                role_runtime = resolve_runtime_provider(
+                    requested=role_provider,
+                    target_model=model,
+                )
+                runtime_kwargs.update({
+                    "api_key": role_runtime.get("api_key"),
+                    "base_url": role_runtime.get("base_url"),
+                    "provider": role_runtime.get("provider"),
+                    "api_mode": role_runtime.get("api_mode"),
+                    "command": role_runtime.get("command"),
+                    "args": list(role_runtime.get("args") or []),
+                    "credential_pool": role_runtime.get("credential_pool"),
+                })
+            except Exception as exc:
+                logger.warning(
+                    "Role provider override failed: role=%s provider=%s error=%s",
+                    role_overrides.get("agent_key"),
+                    role_provider,
+                    exc,
+                )
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -6790,6 +6818,34 @@ class GatewayRunner:
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        if not is_internal:
+            try:
+                from gateway.role_dispatch import route_event_to_role
+                event, source, _role_decision = route_event_to_role(event, _load_gateway_config())
+                if getattr(_role_decision, "route_reason", "default") != "default":
+                    logger.info(
+                        "role route: agent=%s reason=%s platform=%s chat=%s",
+                        getattr(_role_decision, "agent_key", "main"),
+                        getattr(_role_decision, "route_reason", "default"),
+                        source.platform.value if source and source.platform else "unknown",
+                        source.chat_id if source else "unknown",
+                    )
+                # If the router stripped a slash-style routing prefix (`/ask` /
+                # `@role`), the new text no longer starts with `/`. Reset the
+                # message_type so the slash-command dispatcher downstream
+                # treats it as a normal chat message and forwards it to the
+                # selected agent. Without this the message would still be
+                # tagged COMMAND and the dispatcher would look for a handler
+                # for the *original* slash, returning "Unknown command".
+                from gateway.platforms.base import MessageType as _MsgType
+                _new_text = (getattr(event, "text", "") or "").lstrip()
+                _was_slash_route = getattr(_role_decision, "route_reason", "") == "slash_command"
+                if _was_slash_route and not _new_text.startswith("/") and getattr(event, "message_type", None) == _MsgType.COMMAND:
+                    import dataclasses as _dc
+                    event = _dc.replace(event, message_type=_MsgType.TEXT)
+            except Exception as exc:
+                logger.warning("Role routing failed; falling back to default agent: %s", exc, exc_info=True)
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -7466,6 +7522,12 @@ class GatewayRunner:
 
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
+
+        if canonical == "ask":
+            return await self._handle_ask_command(event)
+
+        if canonical == "sessions":
+            return await self._handle_my_sessions_command(event)
 
         if canonical == "status":
             return await self._handle_status_command(event)
@@ -9483,6 +9545,10 @@ class GatewayRunner:
         Reports: platform, scope (DM vs group), the user's tier
         (admin / user / unrestricted), and the slash commands they can
         actually run on this scope.
+
+        The output also includes the user's external_id (e.g. Feishu open_id)
+        so they can send it to the operations admin to bind their Control
+        Panel account to this platform identity.
         """
         from gateway.slash_access import policy_for_source as _policy_for_source
 
@@ -9491,7 +9557,22 @@ class GatewayRunner:
         platform = source.platform.value if source and source.platform else "?"
         chat_type = (source.chat_type if source else "") or "dm"
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
-        user_id = (source.user_id if source else None) or "?"
+        # Prefer original_user_id when present — in group chats, source.user_id
+        # is rewritten to the group owner by the build_source hook. /whoami
+        # should always answer "who is *you*", not "who owns this chat".
+        user_id = (
+            (getattr(source, "original_user_id", None) if source else None)
+            or (source.user_id if source else None)
+            or "?"
+        )
+
+        # Footer: pasteable binding line for the Control Panel admin.
+        # Always included — works the same in DM and group, on every platform.
+        # The user just forwards/copies this to whoever set up the Control Panel.
+        bind_line = (
+            f"\n\n要在 Control Panel 看到自己的会话？把下面这行发给管理员：\n"
+            f"  绑定我: platform=`{platform}`, external_id=`{user_id}`"
+        )
 
         if not policy.enabled:
             return (
@@ -9499,6 +9580,7 @@ class GatewayRunner:
                 f"User ID: `{user_id}`\n"
                 f"Tier: unrestricted (no admin list configured for this scope)\n"
                 f"Slash commands: all available"
+                f"{bind_line}"
             )
 
         if policy.is_admin(user_id):
@@ -9507,6 +9589,7 @@ class GatewayRunner:
                 f"User ID: `{user_id}`\n"
                 f"Tier: **admin**\n"
                 f"Slash commands: all available"
+                f"{bind_line}"
             )
 
         # Non-admin user. Show what's actually reachable.
@@ -9525,7 +9608,197 @@ class GatewayRunner:
             f"User ID: `{user_id}`\n"
             f"Tier: user\n"
             f"Slash commands you can run: {runnable_str}"
+            f"{bind_line}"
         )
+
+
+    async def _handle_ask_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /ask — explicit role routing.
+
+        Usage: /ask <role> [<message>]
+
+        - No args → list available roles
+        - <role> alone (no message) → confirm the switch and prompt the user
+          to send their actual question
+        - <role> <message> → return None and let the rewritten text flow to
+          the target agent (route_event_to_role rewrote event.text and
+          source.agent_key earlier in the pipeline)
+        - unknown <role> → list available roles
+        """
+        raw_args = (event.get_command_args() or "").strip()
+
+        # Build a list of configured roles + their display names so the
+        # error message guides users to a working invocation.
+        roles = []
+        try:
+            cfg = _load_gateway_config()
+            agent_roles_cfg = (cfg or {}).get("agent_roles") or {}
+            roles_dict = agent_roles_cfg.get("roles", {}) if isinstance(agent_roles_cfg, dict) else {}
+            default_role = agent_roles_cfg.get("default", "main") if isinstance(agent_roles_cfg, dict) else "main"
+            for key, meta in roles_dict.items():
+                display = ""
+                if isinstance(meta, dict):
+                    display = meta.get("display_name") or meta.get("name") or ""
+                roles.append((key, str(display), key == default_role))
+        except Exception:
+            logger.debug("ask handler: failed to read agent_roles config", exc_info=True)
+
+        def _help_text(prefix: str = "") -> str:
+            if not roles:
+                return (
+                    f"{prefix}还没有配置任何 agent role。\n"
+                    f"管理员可在 Control Panel → Agent Roles 添加。"
+                )
+            lines = [f"{prefix}用法: `/ask <role> <消息>`", "", "可用 role:"]
+            for key, display, is_default in roles:
+                tag = " (默认)" if is_default else ""
+                label = f" — {display}" if display and display != key else ""
+                lines.append(f"  • `{key}`{label}{tag}")
+            lines.append("")
+            lines.append("例: `/ask " + roles[0][0] + " 帮我写一个 Python 反转字符串的函数`")
+            return "\n".join(lines)
+
+        # No args → show role list.
+        if not raw_args:
+            return _help_text()
+
+        # Parse '<role> [<rest>]'.
+        parts = raw_args.split(maxsplit=1)
+        target_role = parts[0].strip()
+        remainder = parts[1].strip() if len(parts) > 1 else ""
+
+        # Unknown role → guide them.
+        role_info = next(((k, d, is_d) for k, d, is_d in roles if k == target_role), None)
+        if role_info is None:
+            return _help_text(f"⚠ 角色 `{target_role}` 不存在。\n\n")
+
+        # Role exists but message is empty → tell the user how to actually
+        # use it. /ask is per-message routing (one-shot), so an empty
+        # invocation can't "stay on" that role — it would just send an
+        # empty message to the LLM. Guide them to the working form.
+        if not remainder:
+            _, display, is_default = role_info
+            label = f"`{target_role}`" + (f"（{display}）" if display and display != target_role else "")
+            default_note = " — 这也是当前默认 role" if is_default else ""
+            return (
+                f"💡 {label}{default_note}\n\n"
+                f"`/ask` 是一次性路由 — 把要问的内容放在同一行：\n"
+                f"  `/ask {target_role} 你的问题`\n\n"
+                f"想长期切换默认 role？管理员可在 Control Panel → Agent Roles 改 default。"
+            )
+
+        # Valid role + message → return None to let normal message processing
+        # continue. event.text and source.agent_key have already been rewritten
+        # by route_event_to_role() earlier in the pipeline.
+        return None
+
+
+    async def _handle_my_sessions_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /sessions — show the caller's recent sessions across every
+        platform their Control Panel account is bound to.
+
+        On Feishu we render an interactive card with per-row "继续" buttons
+        and pagination. Falling back to a plain-text list on platforms
+        without a card renderer (Telegram, Slack, ...).
+        """
+        source = event.source
+        if source is None or not source.user_id:
+            return "无法识别你的身份。"
+
+        logger.warning(
+            "[sessions] command dispatched: user_id=%r chat_id=%r platform=%r",
+            source.user_id, source.chat_id,
+            getattr(source.platform, "value", source.platform),
+        )
+
+        # Resolve sender's "real" external_id (pre group-ownership rewrite).
+        effective_external = (
+            getattr(source, "original_user_id", None)
+            or source.user_id
+        )
+
+        # Feishu → interactive card (handles its own send + returns None
+        # so the caller doesn't double-send).
+        platform_value = getattr(source.platform, "value", source.platform)
+        if str(platform_value).lower() == "feishu":
+            adapter = self.adapters.get(source.platform)
+            if adapter and hasattr(adapter, "send_my_sessions_card"):
+                try:
+                    result = await adapter.send_my_sessions_card(
+                        chat_id=source.chat_id,
+                        owner_external_id=effective_external,
+                        page=0,
+                    )
+                    if result and getattr(result, "success", False):
+                        return None
+                    logger.warning(
+                        "[Feishu] sessions card send failed: %s — falling back to text",
+                        getattr(result, "error", "unknown") if result else "no result",
+                    )
+                except Exception:
+                    logger.warning("Feishu sessions card send crashed; falling back to text", exc_info=True)
+
+        try:
+            from gateway.cross_platform_sessions import list_my_sessions, count_my_sessions
+        except Exception:
+            logger.debug("cross_platform_sessions import failed", exc_info=True)
+            return "Sessions module 加载失败，请稍后再试。"
+
+        # state.db path — gateway always knows its own home.
+        try:
+            state_db = _hermes_home / "state.db"
+        except Exception:
+            return "无法定位 state.db。"
+
+        # First page: 5 entries.
+        page_size = 5
+        try:
+            sessions = list_my_sessions(
+                state_db_path=state_db,
+                platform=source.platform,
+                external_id=effective_external,
+                limit=page_size,
+                offset=0,
+            )
+            total = count_my_sessions(
+                state_db_path=state_db,
+                platform=source.platform,
+                external_id=effective_external,
+            )
+        except Exception:
+            logger.debug("list_my_sessions failed", exc_info=True)
+            return "查询历史 session 失败。"
+
+        if not sessions:
+            return (
+                "你还没有任何历史 session 哦。\n"
+                "在飞书/其它平台和 Bot 聊一句话就会创建一个新 session。"
+            )
+
+        lines = [f"📋 你最近的 sessions（共 {total}，显示前 {len(sessions)}）", ""]
+        for idx, s in enumerate(sessions, start=1):
+            title = (s.get("title") or "(未命名)").strip()
+            if len(title) > 40:
+                title = title[:37] + "…"
+            agent_key = s.get("agent_key") or "main"
+            msg_count = s.get("message_count") or 0
+            cost = float(s.get("estimated_cost_usd") or 0)
+            last_at = s.get("last_message_at") or s.get("started_at") or ""
+            # Trim to date+hh:mm
+            if isinstance(last_at, str) and len(last_at) >= 16:
+                last_at = last_at[:16].replace("T", " ")
+            cost_str = f" · ${cost:.4f}" if cost else ""
+            lines.append(
+                f"{idx}. **{title}**\n"
+                f"   角色 `{agent_key}` · {msg_count} 条消息 · {last_at}{cost_str}\n"
+                f"   ID `{s.get('session_id', '')}`"
+            )
+
+        lines.append("")
+        lines.append("用 `/resume <id>` 切回某个 session 继续聊。")
+        if total > len(sessions):
+            lines.append(f"（还有 {total - len(sessions)} 个更早的 — 翻页功能正在路上）")
+        return "\n".join(lines)
 
 
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
@@ -12951,10 +13224,51 @@ class GatewayRunner:
         history = self.session_store.load_transcript(target_id)
         msg_count = len([m for m in history if m.get("role") == "user"]) if history else 0
         if not msg_count:
-            return t("gateway.resume.resumed_no_count", title=title)
-        if msg_count == 1:
-            return t("gateway.resume.resumed_one", title=title, count=msg_count)
-        return t("gateway.resume.resumed_many", title=title, count=msg_count)
+            base = t("gateway.resume.resumed_no_count", title=title)
+        elif msg_count == 1:
+            base = t("gateway.resume.resumed_one", title=title, count=msg_count)
+        else:
+            base = t("gateway.resume.resumed_many", title=title, count=msg_count)
+
+        # Append a short recap of the last few exchanges so the user can
+        # pick up where they left off without scrolling back through
+        # the chat history. Mobile users especially benefit — the chat
+        # window may not have the original messages cached.
+        recap = self._format_resume_recap(history, max_pairs=3)
+        if recap:
+            return f"{base}\n\n{recap}"
+        return base
+
+    def _format_resume_recap(self, history: Optional[List[Dict[str, Any]]], *, max_pairs: int = 3) -> str:
+        """Render the last few user/assistant exchanges as a recap block.
+
+        Picks the most recent `max_pairs` user messages plus the
+        assistant reply that immediately followed each one. Trims content
+        aggressively so the output fits inside one Feishu card / IM bubble.
+        """
+        if not history:
+            return ""
+        # Walk forward keeping only user + assistant turns; skip tool I/O.
+        chat_turns: list[dict] = []
+        for m in history:
+            role = (m.get("role") or "").lower()
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                chat_turns.append({"role": role, "content": content})
+        if not chat_turns:
+            return ""
+        # Take the tail.
+        tail = chat_turns[-max_pairs * 2:]
+        if not tail:
+            return ""
+        lines = ["📜 **最近对话回顾**"]
+        for turn in tail:
+            label = "你" if turn["role"] == "user" else "Bot"
+            text = " ".join(turn["content"].split())  # collapse whitespace
+            if len(text) > 140:
+                text = text[:137] + "…"
+            lines.append(f"**{label}:** {text}")
+        return "\n".join(lines)
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:
         """Handle /branch [name] — fork the current session into a new independent copy.
@@ -14479,6 +14793,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            agent_key=getattr(context.source, "agent_key", "main"),
             message_id=str(context.source.message_id) if context.source.message_id else "",
         )
 
@@ -15005,6 +15320,21 @@ class GatewayRunner:
         except Exception:
             out["tools.registry_generation"] = None
         return out
+
+    @staticmethod
+    def _read_role_model_overrides(user_config: dict | None, source: Optional[SessionSource]) -> dict:
+        try:
+            from gateway.agent_roles import AgentRoleRegistry
+
+            registry = AgentRoleRegistry.from_config(user_config if isinstance(user_config, dict) else {})
+            role = registry.get(getattr(source, "agent_key", "main") if source else "main")
+            return {
+                "agent_key": role.key,
+                "model": role.model,
+                "provider": role.provider,
+            }
+        except Exception:
+            return {"agent_key": "main", "model": None, "provider": None}
 
     @staticmethod
     def _agent_config_signature(
@@ -15778,7 +16108,22 @@ class GatewayRunner:
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
-        disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or []
+        if isinstance(disabled_toolsets, str):
+            disabled_toolsets = [disabled_toolsets]
+        elif not isinstance(disabled_toolsets, list):
+            disabled_toolsets = []
+
+        from gateway.agent_roles import build_role_overlay
+        role_overlay = build_role_overlay(
+            config=user_config,
+            agent_key=getattr(source, "agent_key", "main"),
+            platform_toolsets=enabled_toolsets,
+            global_disabled_toolsets=disabled_toolsets,
+            config_dir=_hermes_home,
+        )
+        enabled_toolsets = role_overlay.enabled_toolsets
+        disabled_toolsets = role_overlay.disabled_toolsets or None
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -16441,6 +16786,8 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            if role_overlay.ephemeral_system_prompt:
+                combined_ephemeral = role_overlay.ephemeral_system_prompt
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
@@ -16586,7 +16933,15 @@ class GatewayRunner:
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys={
+                    **self._extract_cache_busting_config(user_config),
+                    **{f"role.{k}": v for k, v in role_overlay.cache_key.items()},
+                    "approval_policies": (
+                        user_config.get("approval_policies")
+                        if isinstance(user_config, dict)
+                        else None
+                    ),
+                },
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -16636,6 +16991,9 @@ class GatewayRunner:
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    agent_key=role_overlay.role.key,
+                    memory_scope=role_overlay.role.memory_scope,
+                    approval_policy=role_overlay.role.approval_policy,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -16833,9 +17191,17 @@ class GatewayRunner:
             # to the user immediately.
             from tools.approval import (
                 register_gateway_notify,
+                reset_current_approval_policy,
                 reset_current_session_key,
+                set_current_approval_policy,
                 set_current_session_key,
                 unregister_gateway_notify,
+            )
+            from tools.tool_policy import (
+                reset_current_tool_policy_configs,
+                reset_current_tool_policy,
+                set_current_tool_policy_configs,
+                set_current_tool_policy,
             )
 
             def _approval_notify_sync(approval_data: dict) -> None:
@@ -17005,6 +17371,13 @@ class GatewayRunner:
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
+            _approval_policy_token = set_current_approval_policy(role_overlay.role.approval_policy)
+            _tool_policy_token = set_current_tool_policy(role_overlay.role.approval_policy)
+            _tool_policy_configs_token = set_current_tool_policy_configs(
+                user_config.get("approval_policies")
+                if isinstance(user_config, dict)
+                else None
+            )
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
@@ -17060,6 +17433,9 @@ class GatewayRunner:
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+                reset_current_approval_policy(_approval_policy_token)
+                reset_current_tool_policy_configs(_tool_policy_configs_token)
+                reset_current_tool_policy(_tool_policy_token)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
