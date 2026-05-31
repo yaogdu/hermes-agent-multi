@@ -36,6 +36,21 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
+_approval_policy: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_policy",
+    default="",
+)
+
+_DENY_POLICY_NAMES = {"deny", "deny_all", "deny_dangerous", "block", "blocked"}
+_MANUAL_POLICY_NAMES = {"manual", "manual_required", "require_manual", "approval_required"}
+_SMART_POLICY_NAMES = {"smart", "standard_smart"}
+_OFF_POLICY_NAMES = {"off", "yolo", "allow_all", "auto_approve"}
+_STANDARD_POLICY_NAMES = {"standard", "default", "ops_safe", "code_safe", "code_review"}
+
+
+def _normalize_role_approval_policy(policy: str) -> str:
+    text = str(policy or "").strip().lower().replace("-", "_")
+    return text or "standard"
 
 
 def _fire_approval_hook(hook_name: str, **kwargs) -> None:
@@ -72,6 +87,58 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+
+
+def set_current_approval_policy(policy: str) -> contextvars.Token[str]:
+    """Bind the active role approval policy to the current context."""
+    return _approval_policy.set(_normalize_role_approval_policy(policy))
+
+
+def reset_current_approval_policy(token: contextvars.Token[str]) -> None:
+    """Restore the prior role approval policy context."""
+    _approval_policy.reset(token)
+
+
+def get_current_approval_policy(default: str = "standard") -> str:
+    policy = _approval_policy.get()
+    if policy:
+        return _normalize_role_approval_policy(policy)
+    try:
+        from gateway.session_context import get_session_env
+
+        policy = get_session_env("HERMES_APPROVAL_POLICY", "")
+        if policy:
+            return _normalize_role_approval_policy(policy)
+    except Exception:
+        pass
+    return _normalize_role_approval_policy(os.getenv("HERMES_APPROVAL_POLICY", default))
+
+
+def _apply_role_approval_policy_mode(config_mode: str) -> str:
+    """Return effective approval mode after role-level governance is applied."""
+    policy = get_current_approval_policy()
+    if policy in _MANUAL_POLICY_NAMES or policy in _DENY_POLICY_NAMES:
+        return "manual"
+    if policy in _SMART_POLICY_NAMES:
+        return "smart"
+    if policy in _OFF_POLICY_NAMES:
+        return "off"
+    return config_mode
+
+
+def _role_policy_block_result(description: str) -> dict:
+    policy = get_current_approval_policy()
+    return {
+        "approved": False,
+        "message": (
+            f"BLOCKED by role approval policy '{policy}': {description}. "
+            "This role is not allowed to execute dangerous commands. "
+            "Do NOT retry or attempt the same outcome through another command."
+        ),
+        "role_approval_policy": policy,
+        "outcome": "policy_denied",
+        "user_consent": False,
+    }
 
 
 def get_current_session_key(default: str = "default") -> str:
@@ -943,13 +1010,17 @@ def check_dangerous_command(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
-        return {"approved": True, "message": None}
-
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
+        return {"approved": True, "message": None}
+
+    if get_current_approval_policy() in _DENY_POLICY_NAMES:
+        return _role_policy_block_result(description)
+
+    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
+    # CLI --yolo remains process-scoped via the env var for local use. Role
+    # deny policies above remain a governance floor.
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
@@ -1083,9 +1154,16 @@ def check_all_command_guards(command: str, env_type: str,
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
 
+    # Role deny policies are a governance floor and must not be bypassed by
+    # yolo/session approval state.
+    if get_current_approval_policy() in _DENY_POLICY_NAMES:
+        is_dangerous_for_policy, _policy_key, policy_desc = detect_dangerous_command(command)
+        if is_dangerous_for_policy:
+            return _role_policy_block_result(policy_desc)
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
-    approval_mode = _get_approval_mode()
+    approval_mode = _apply_role_approval_policy_mode(_get_approval_mode())
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
 
@@ -1154,6 +1232,10 @@ def check_all_command_guards(command: str, env_type: str,
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
+
+    if get_current_approval_policy() in _DENY_POLICY_NAMES:
+        combined_desc = "; ".join(desc for _, desc, _ in warnings)
+        return _role_policy_block_result(combined_desc)
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.

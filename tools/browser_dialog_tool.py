@@ -145,4 +145,5 @@ registry.register(
     ),
     check_fn=_browser_dialog_check,
     emoji="💬",
+    metadata={"risk_category": "external_action"},
 )

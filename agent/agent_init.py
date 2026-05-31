@@ -42,6 +42,13 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.runtime_governance import (
+    normalize_agent_key,
+    normalize_memory_scope,
+    normalize_policy_name,
+    role_scoped_gateway_session_key,
+    role_scoped_identity,
+)
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
@@ -189,6 +196,9 @@ def init_agent(
     chat_type: str = None,
     thread_id: str = None,
     gateway_session_key: str = None,
+    agent_key: str = "main",
+    memory_scope: str = "user_session",
+    approval_policy: str = "standard",
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
@@ -271,6 +281,9 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    agent._agent_key = normalize_agent_key(agent_key)
+    agent._memory_scope = normalize_memory_scope(memory_scope)
+    agent._approval_policy = normalize_policy_name(approval_policy)
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1061,6 +1074,8 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    if agent._memory_scope == "disabled":
+        skip_memory = True
     if not skip_memory:
         try:
             mem_config = _agent_cfg.get("memory", {})
@@ -1124,12 +1139,22 @@ def init_agent(
                         _init_kwargs["thread_id"] = agent._thread_id
                     # Thread gateway session key for stable per-chat Honcho session isolation
                     if agent._gateway_session_key:
-                        _init_kwargs["gateway_session_key"] = agent._gateway_session_key
+                        _init_kwargs["gateway_session_key"] = role_scoped_gateway_session_key(
+                            agent._gateway_session_key,
+                            agent_key=agent._agent_key,
+                            memory_scope=agent._memory_scope,
+                        )
+                    _init_kwargs["agent_key"] = agent._agent_key
+                    _init_kwargs["memory_scope"] = agent._memory_scope
                     # Profile identity for per-profile provider scoping
                     try:
                         from hermes_cli.profiles import get_active_profile_name
                         _profile = get_active_profile_name()
-                        _init_kwargs["agent_identity"] = _profile
+                        _init_kwargs["agent_identity"] = role_scoped_identity(
+                            _profile,
+                            agent_key=agent._agent_key,
+                            memory_scope=agent._memory_scope,
+                        )
                         _init_kwargs["agent_workspace"] = "hermes"
                     except Exception:
                         pass

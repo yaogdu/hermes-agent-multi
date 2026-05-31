@@ -64,6 +64,7 @@ from .whatsapp_identity import (
     canonical_whatsapp_identifier,
     normalize_whatsapp_identifier,  # noqa: F401 - re-exported for gateway.session callers
 )
+from .agent_roles import normalize_agent_key
 from utils import atomic_replace
 
 
@@ -91,6 +92,11 @@ class SessionSource:
     guild_id: Optional[str] = None  # Discord guild / Slack workspace / Matrix server scope
     parent_chat_id: Optional[str] = None  # Parent channel when chat_id refers to a thread
     message_id: Optional[str] = None  # ID of the triggering message (for pin/reply/react)
+    agent_key: str = "main"  # Team Edition role key; defaults preserve legacy single-agent keys.
+    # Original (pre-rewrite) user_id, preserved before the group-ownership hook
+    # in base.build_source rewrites user_id to the group owner's id. Lets
+    # /whoami and audit logs show "you sent this" rather than "the owner".
+    original_user_id: Optional[str] = None
     
     @property
     def description(self) -> str:
@@ -123,6 +129,7 @@ class SessionSource:
             "user_name": self.user_name,
             "thread_id": self.thread_id,
             "chat_topic": self.chat_topic,
+            "agent_key": normalize_agent_key(self.agent_key),
         }
         if self.user_id_alt:
             d["user_id_alt"] = self.user_id_alt
@@ -152,6 +159,7 @@ class SessionSource:
             guild_id=data.get("guild_id"),
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
+            agent_key=normalize_agent_key(data.get("agent_key", "main")),
         )
     
 
@@ -626,6 +634,7 @@ def build_session_key(
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
     platform = source.platform.value
+    agent_prefix = f"agent:{normalize_agent_key(getattr(source, 'agent_key', 'main'))}"
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -633,11 +642,11 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"agent:main:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"agent:main:{platform}:dm:{dm_chat_id}"
+                return f"{agent_prefix}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
+            return f"{agent_prefix}:{platform}:dm:{dm_chat_id}"
         if source.thread_id:
-            return f"agent:main:{platform}:dm:{source.thread_id}"
-        return f"agent:main:{platform}:dm"
+            return f"{agent_prefix}:{platform}:dm:{source.thread_id}"
+        return f"{agent_prefix}:{platform}:dm"
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -645,7 +654,7 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = ["agent:main", platform, source.chat_type]
+    key_parts = [agent_prefix, platform, source.chat_type]
 
     if source.chat_id:
         key_parts.append(source.chat_id)

@@ -122,15 +122,22 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/dashboard/plugins",
 })
 
+# Control Panel API prefixes — these paths use their own session-token auth
+# (via X-AgentOps-Session header), so the dashboard ephemeral token middleware
+# must let them through.
+_CONTROL_PANEL_API_PREFIXES = ("/api/auth/", "/api/admin/")
+
 
 def _has_valid_session_token(request: Request) -> bool:
-    """True if the request carries a valid dashboard session token.
+    """True if the request carries a valid dashboard session token OR a valid
+    Control Panel session token (X-AgentOps-Session header).
 
     The dedicated session header avoids collisions with reverse proxies that
     already use ``Authorization`` (for example Caddy ``basic_auth``). We still
     accept the legacy Bearer path for backward compatibility with older
     dashboard bundles.
     """
+    # 1. Dashboard ephemeral token (X-Hermes-Session-Token or Authorization: Bearer)
     session_header = request.headers.get(_SESSION_HEADER_NAME, "")
     if session_header and hmac.compare_digest(
         session_header.encode(),
@@ -140,7 +147,24 @@ def _has_valid_session_token(request: Request) -> bool:
 
     auth = request.headers.get("authorization", "")
     expected = f"Bearer {_SESSION_TOKEN}"
-    return hmac.compare_digest(auth.encode(), expected.encode())
+    if hmac.compare_digest(auth.encode(), expected.encode()):
+        return True
+
+    # 2. Control Panel session token (X-AgentOps-Session)
+    cp_token = request.headers.get("X-AgentOps-Session", "").strip()
+    if cp_token:
+        try:
+            from hermes_cli.control.routes import get_control_db_path
+            db_path = get_control_db_path()
+            if db_path:
+                from hermes_cli.control.auth import resolve_session_to_user
+                resolved = resolve_session_to_user(db_path, cp_token)
+                if resolved is not None:
+                    return True
+        except Exception:
+            pass
+
+    return False
 
 
 def _require_token(request: Request) -> None:
@@ -236,14 +260,16 @@ async def host_header_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
+    """Require the session token on all /api/ routes except the public list
+    and control panel endpoints (which use their own session auth)."""
     path = request.url.path
     if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
-        if not _has_valid_session_token(request):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Unauthorized"},
-            )
+        if not any(path.startswith(p) for p in _CONTROL_PANEL_API_PREFIXES):
+            if not _has_valid_session_token(request):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Unauthorized"},
+                )
     return await call_next(request)
 
 
@@ -773,21 +799,79 @@ async def get_action_status(name: str, lines: int = 200):
     }
 
 
+def _get_user_ids_scope(request: Request) -> list[str] | None:
+    """Resolve the Control Panel session → user_ids scope filter.
+
+    Returns None for admin/system users (access to all sessions) or when
+    no Control Panel session is present (dashboard ephemeral token — full access).
+    Returns a list of external_ids for regular users (only see their own sessions).
+    An empty list means the user has no bound identities and will see nothing.
+    """
+    cp_token = request.headers.get("X-AgentOps-Session", "").strip()
+    if not cp_token:
+        return None  # dashboard ephemeral token — full access
+    try:
+        from hermes_cli.control.routes import get_control_db_path
+        db_path = get_control_db_path()
+        if not db_path:
+            return None
+        from hermes_cli.control.auth import resolve_session_to_user, is_admin, scope_for_user
+        resolved = resolve_session_to_user(db_path, cp_token)
+        if resolved is None:
+            return None
+        user = resolved["user"]
+        if is_admin(user):
+            return None
+        scope = scope_for_user(db_path, user)
+        if scope["all"]:
+            return None
+        return scope["hermes_user_ids"] if scope["hermes_user_ids"] else []
+    except Exception:
+        _log.debug("Failed to resolve scope from control session", exc_info=True)
+        return None
+
+
+def _build_user_id_clause(request: Request) -> tuple[str, tuple]:
+    """Build a SQL WHERE clause fragment for user_id filtering.
+
+    Returns (clause_sql, params_tuple). The clause is empty string when
+    the user has full access (admin or no control session).
+    """
+    user_ids = _get_user_ids_scope(request)
+    if user_ids is None:
+        return ("", ())
+    if not user_ids:
+        return ("AND 0", ())  # no identities bound → show nothing
+    placeholders = ",".join("?" for _ in user_ids)
+    return (f"AND user_id IN ({placeholders})", tuple(user_ids))
+
+
 @app.get("/api/sessions")
-async def get_sessions(limit: int = 20, offset: int = 0):
+async def get_sessions(request: Request, limit: int = 20, offset: int = 0):
     try:
         from hermes_state import SessionDB
+        user_ids_filter = _get_user_ids_scope(request)
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=limit, offset=offset)
-            total = db.session_count()
+            sessions = db.list_sessions_rich(
+                limit=limit,
+                offset=offset,
+                user_ids=user_ids_filter,
+            )
+            total = db.session_count(user_ids=user_ids_filter)
             now = time.time()
             for s in sessions:
                 s["is_active"] = (
                     s.get("ended_at") is None
                     and (now - s.get("last_active", s.get("started_at", 0))) < 300
                 )
-            return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
+            return {
+                "sessions": sessions,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "scope_all": user_ids_filter is None,
+            }
         finally:
             db.close()
     except Exception:
@@ -3126,14 +3210,16 @@ async def update_config_raw(body: RawConfigUpdate):
 
 
 @app.get("/api/analytics/usage")
-async def get_usage_analytics(days: int = 30):
+async def get_usage_analytics(request: Request, days: int = 30):
     from hermes_state import SessionDB
     from agent.insights import InsightsEngine
+
+    user_clause, user_params = _build_user_id_clause(request)
 
     db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
-        cur = db._conn.execute("""
+        cur = db._conn.execute(f"""
             SELECT date(started_at, 'unixepoch') as day,
                    SUM(input_tokens) as input_tokens,
                    SUM(output_tokens) as output_tokens,
@@ -3143,24 +3229,24 @@ async def get_usage_analytics(days: int = 30):
                    COALESCE(SUM(actual_cost_usd), 0) as actual_cost,
                    COUNT(*) as sessions,
                    SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ?
+            FROM sessions WHERE started_at > ? {user_clause}
             GROUP BY day ORDER BY day
-        """, (cutoff,))
+        """, (cutoff,) + user_params)
         daily = [dict(r) for r in cur.fetchall()]
 
-        cur2 = db._conn.execute("""
+        cur2 = db._conn.execute(f"""
             SELECT model,
                    SUM(input_tokens) as input_tokens,
                    SUM(output_tokens) as output_tokens,
                    COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
                    COUNT(*) as sessions,
                    SUM(COALESCE(api_call_count, 0)) as api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL
+            FROM sessions WHERE started_at > ? AND model IS NOT NULL {user_clause}
             GROUP BY model ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
+        """, (cutoff,) + user_params)
         by_model = [dict(r) for r in cur2.fetchall()]
 
-        cur3 = db._conn.execute("""
+        cur3 = db._conn.execute(f"""
             SELECT SUM(input_tokens) as total_input,
                    SUM(output_tokens) as total_output,
                    SUM(cache_read_tokens) as total_cache_read,
@@ -3169,8 +3255,8 @@ async def get_usage_analytics(days: int = 30):
                    COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
                    COUNT(*) as total_sessions,
                    SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ?
-        """, (cutoff,))
+            FROM sessions WHERE started_at > ? {user_clause}
+        """, (cutoff,) + user_params)
         totals = dict(cur3.fetchone())
         insights_report = InsightsEngine(db).generate(days=days)
         skills = insights_report.get("skills", {
@@ -3195,7 +3281,7 @@ async def get_usage_analytics(days: int = 30):
 
 
 @app.get("/api/analytics/models")
-async def get_models_analytics(days: int = 30):
+async def get_models_analytics(request: Request, days: int = 30):
     """Rich per-model analytics for the Models dashboard page.
 
     Returns token/cost/session breakdown per model plus capability metadata
@@ -3203,11 +3289,13 @@ async def get_models_analytics(days: int = 30):
     """
     from hermes_state import SessionDB
 
+    user_clause, user_params = _build_user_id_clause(request)
+
     db = SessionDB()
     try:
         cutoff = time.time() - (days * 86400)
 
-        cur = db._conn.execute("""
+        cur = db._conn.execute(f"""
             SELECT model,
                    billing_provider,
                    SUM(input_tokens) as input_tokens,
@@ -3221,10 +3309,10 @@ async def get_models_analytics(days: int = 30):
                    SUM(tool_call_count) as tool_calls,
                    MAX(started_at) as last_used_at,
                    AVG(input_tokens + output_tokens) as avg_tokens_per_session
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
+            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != '' {user_clause}
             GROUP BY model, billing_provider
             ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-        """, (cutoff,))
+        """, (cutoff,) + user_params)
         rows = [dict(r) for r in cur.fetchall()]
 
         models = []
@@ -3264,7 +3352,7 @@ async def get_models_analytics(days: int = 30):
                 "capabilities": caps,
             })
 
-        totals_cur = db._conn.execute("""
+        totals_cur = db._conn.execute(f"""
             SELECT COUNT(DISTINCT model) as distinct_models,
                    SUM(input_tokens) as total_input,
                    SUM(output_tokens) as total_output,
@@ -3274,8 +3362,8 @@ async def get_models_analytics(days: int = 30):
                    COALESCE(SUM(actual_cost_usd), 0) as total_actual_cost,
                    COUNT(*) as total_sessions,
                    SUM(COALESCE(api_call_count, 0)) as total_api_calls
-            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != ''
-        """, (cutoff,))
+            FROM sessions WHERE started_at > ? AND model IS NOT NULL AND model != '' {user_clause}
+        """, (cutoff,) + user_params)
         totals = dict(totals_cur.fetchone())
 
         return {
@@ -4688,7 +4776,52 @@ def _mount_plugin_api_routes():
 # Mount plugin API routes before the SPA catch-all.
 _mount_plugin_api_routes()
 
+# Mount Control Panel auth + admin API routes.
+try:
+    from hermes_cli.control.routes import router as _control_router, set_control_db_path
+    app.include_router(_control_router)
+    _log.info("Mounted Control Panel API routes (/api/auth/*, /api/admin/*)")
+except Exception:
+    _log.debug("Control Panel routes not available", exc_info=True)
+
 mount_spa(app)
+
+
+def _setup_control_panel_db():
+    """Initialize the Control Panel database: apply migrations, bootstrap admin.
+
+    The db path comes from ``AGENTOPS_CONTROL_DB_PATH`` env var, defaulting to
+    ``~/.hermes/agentops_control.db``.
+    """
+    try:
+        from hermes_cli.control.migrations import apply_migrations, bootstrap_admin
+        from hermes_cli.control.routes import set_control_db_path as _set_db
+    except ImportError:
+        _log.debug("Control Panel modules not available; skipping db setup")
+        return
+
+    db_path = Path(
+        os.environ.get(
+            "AGENTOPS_CONTROL_DB_PATH",
+            str(get_hermes_home() / "agentops_control.db"),
+        )
+    )
+    _log.info("Control Panel db: %s", db_path)
+    _set_db(db_path)
+
+    try:
+        version = apply_migrations(db_path)
+        _log.info("Control Panel migrations applied (v%d)", version)
+    except Exception:
+        _log.exception("Control Panel migrations failed")
+        return
+
+    try:
+        admin = bootstrap_admin(db_path)
+        if admin:
+            _log.warning("Bootstrap admin created: %s", admin["username"])
+    except Exception:
+        _log.exception("Control Panel bootstrap_admin failed")
 
 
 def start_server(
@@ -4724,6 +4857,9 @@ def start_server(
     # PTY child uses to publish events to the dashboard sidebar.
     app.state.bound_host = host
     app.state.bound_port = port
+
+    # ── Control Panel database setup ───────────────────────────────────────
+    _setup_control_panel_db()
 
     if open_browser:
         import webbrowser

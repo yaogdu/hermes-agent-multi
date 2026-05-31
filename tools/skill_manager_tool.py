@@ -1031,4 +1031,5 @@ registry.register(
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into")),
     emoji="📝",
+    metadata={"risk_category": "write"},
 )

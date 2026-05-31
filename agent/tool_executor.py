@@ -48,6 +48,7 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
+from tools.tool_policy import enforce_tool_policy
 
 logger = logging.getLogger(__name__)
 
@@ -135,10 +136,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if block_message is not None:
             block_result = json.dumps({"error": block_message}, ensure_ascii=False)
         else:
-            guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-            if not guardrail_decision.allows_execution:
-                block_result = agent._guardrail_block_result(guardrail_decision)
-                blocked_by_guardrail = True
+            policy_block = enforce_tool_policy(function_name, function_args)
+            if policy_block is not None:
+                block_result = policy_block
+            else:
+                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+                if not guardrail_decision.allows_execution:
+                    block_result = agent._guardrail_block_result(guardrail_decision)
+                    blocked_by_guardrail = True
 
         parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
@@ -508,12 +513,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
+        _policy_block_msg: Optional[str] = None
         if _block_msg is None:
+            _policy_block_msg = enforce_tool_policy(function_name, function_args)
+
+        if _block_msg is None and _policy_block_msg is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        _execution_blocked = (
+            _block_msg is not None
+            or _policy_block_msg is not None
+            or _guardrail_block_decision is not None
+        )
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -590,6 +603,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if _block_msg is not None:
             # Tool blocked by plugin policy — return error without executing.
             function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+            tool_duration = 0.0
+        elif _policy_block_msg is not None:
+            function_result = _policy_block_msg
             tool_duration = 0.0
         elif _guardrail_block_decision is not None:
             # Tool blocked by tool-loop guardrail — synthesize exactly one
@@ -752,6 +768,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
+                    skip_tool_policy_check=True,
                 )
                 _spinner_result = function_result
             except Exception as tool_error:
@@ -772,6 +789,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
+                    skip_tool_policy_check=True,
                 )
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"

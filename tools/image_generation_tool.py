@@ -993,4 +993,5 @@ registry.register(
     requires_env=[],
     is_async=False,   # sync fal_client API to avoid "Event loop is closed" in gateway
     emoji="🎨",
+    metadata={"risk_category": "external_action"},
 )

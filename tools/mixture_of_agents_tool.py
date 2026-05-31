@@ -539,4 +539,5 @@ registry.register(
     requires_env=["OPENROUTER_API_KEY"],
     is_async=True,
     emoji="🧠",
+    metadata={"risk_category": "external_action"},
 )

@@ -201,6 +201,37 @@ class TestAgentConfigSignature:
 
         assert sig_before != sig_after
 
+    def test_approval_policies_change_busts_cache_when_included(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        sig_before = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            ["memory"],
+            "",
+            cache_keys={
+                "role.approval_policy": "ops_safe",
+                "approval_policies": {
+                    "ops_safe": {"require_approval": ["terminal"]}
+                },
+            },
+        )
+        sig_after = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            ["memory"],
+            "",
+            cache_keys={
+                "role.approval_policy": "ops_safe",
+                "approval_policies": {
+                    "ops_safe": {"deny": ["terminal"]}
+                },
+            },
+        )
+
+        assert sig_before != sig_after
+
 
 class TestExtractCacheBustingConfig:
     """Verify _extract_cache_busting_config pulls the documented subset of

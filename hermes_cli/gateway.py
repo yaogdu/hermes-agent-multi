@@ -4514,6 +4514,22 @@ def _setup_feishu():
     if bot_name:
         print_info(f"  Bot: {bot_name}")
 
+    # ── Bot menu setup ──
+    # Feishu's chat_menu_tree API (for group menus) only supports URL
+    # redirect items — quick-command items ("/help") need the global bot
+    # custom menu, which has no public API.  Users configure it manually:
+    print()
+    if app_id:
+        print_info(f"  Configure bot menu: https://open.feishu.cn/app/{app_id}/feature/bot")
+    else:
+        print_info("  Configure bot menu: https://open.feishu.cn/app → 机器人 → 自定义菜单")
+    print_info("  Add these quick commands:")
+    print_info("    /new /sessions /resume /status /agents")
+    print_info("    /retry /undo /branch /background /stop")
+    print_info("    /model /fast /reasoning /yolo /voice")
+    print_info("    /help /whoami /bind /profile /goal /footer")
+    print_info("  Then click 创建版本 → 发布")
+
 
 def _setup_qqbot():
     """Interactive setup for QQ Bot — scan-to-configure or manual credentials."""

@@ -48,6 +48,7 @@ from typing import Any, FrozenSet, Iterable, Optional, Tuple
 # fallback floor — anything in ``user_allowed_commands`` overrides it
 # additively, never restrictively).
 _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
+    "bind",
     "help",
     "whoami",
 })

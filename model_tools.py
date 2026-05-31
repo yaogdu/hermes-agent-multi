@@ -747,6 +747,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    skip_tool_policy_check: bool = False,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -770,6 +771,16 @@ def handle_function_call(
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
+
+        if not skip_tool_policy_check:
+            try:
+                from tools.tool_policy import enforce_tool_policy
+
+                policy_block = enforce_tool_policy(function_name, function_args)
+                if policy_block is not None:
+                    return policy_block
+            except Exception as _policy_err:
+                logger.debug("tool policy check error: %s", _policy_err)
 
         # Check plugin hooks for a block directive (unless caller already
         # checked — e.g. run_agent._invoke_tool passes skip=True to

@@ -599,4 +599,5 @@ registry.register(
     ),
     check_fn=check_session_search_requirements,
     emoji="🔍",
+    metadata={"risk_category": "read_only"},
 )

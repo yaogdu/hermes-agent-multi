@@ -947,6 +947,7 @@ registry.register(
     handler=_make_handler(discord_core),
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
+    metadata={"risk_category": "external_action"},
 )
 
 registry.register(
@@ -956,4 +957,5 @@ registry.register(
     handler=_make_handler(discord_admin_handler),
     check_fn=check_discord_tool_requirements,
     requires_env=["DISCORD_BOT_TOKEN"],
+    metadata={"risk_category": "external_action"},
 )

@@ -43,6 +43,11 @@ export async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> 
   if (token) {
     setSessionHeader(headers, token);
   }
+  // Inject control panel session token for /api/auth/ and /api/admin/ routes.
+  if (url.startsWith("/api/auth/") || url.startsWith("/api/admin/")) {
+    const cpToken = getControlSessionToken();
+    if (cpToken) headers.set("X-AgentOps-Session", cpToken);
+  }
   const res = await fetch(`${BASE}${url}`, { ...init, headers });
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
@@ -64,6 +69,14 @@ async function getSessionToken(): Promise<string> {
     return _sessionToken;
   }
   throw new Error("Session token not available — page must be served by the Hermes dashboard server");
+}
+
+function getControlSessionToken(): string | null {
+  try {
+    return localStorage.getItem("agentops_session_token");
+  } catch {
+    return null;
+  }
 }
 
 export const api = {
@@ -346,6 +359,91 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name }),
     }),
+
+  // ── Control Panel: Auth ──────────────────────────────────────────────
+  cpLogin: (username: string, password: string) =>
+    fetchJSON<{ token: string; session_id: string; expires_at: string; user: ControlUser }>(
+      "/api/auth/login",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      },
+    ),
+  cpLogout: () =>
+    fetchJSON<{ ok: boolean }>("/api/auth/logout", { method: "POST" }),
+  cpMe: () =>
+    fetchJSON<{ user: ControlUser; session: Record<string, unknown>; scope: { all: boolean; hermes_user_ids: string[] } }>(
+      "/api/auth/me",
+    ),
+  cpChangePassword: (current_password: string, new_password: string) =>
+    fetchJSON<{ ok: boolean }>("/api/auth/change-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+
+  // ── Control Panel: Admin — Users ─────────────────────────────────────
+  cpListUsers: (params?: { role?: string; status?: string; search?: string; limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.role) qs.set("role", params.role);
+    if (params?.status) qs.set("status", params.status);
+    if (params?.search) qs.set("search", params.search);
+    if (params?.limit) qs.set("limit", String(params.limit));
+    if (params?.offset) qs.set("offset", String(params.offset));
+    return fetchJSON<ControlUser[]>("/api/admin/users?" + qs.toString());
+  },
+  cpCreateUser: (body: { username: string; password: string; role?: string; display_name?: string }) =>
+    fetchJSON<ControlUser>("/api/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  cpGetUser: (userId: string) =>
+    fetchJSON<ControlUser>(`/api/admin/users/${encodeURIComponent(userId)}`),
+  cpUpdateUser: (userId: string, body: { role?: string; status?: string; display_name?: string; password?: string }) =>
+    fetchJSON<ControlUser>(`/api/admin/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  // ── Control Panel: Admin — Identities ────────────────────────────────
+  cpListIdentities: (params?: { user_id?: string; platform?: string; unassigned_only?: boolean }) => {
+    const qs = new URLSearchParams();
+    if (params?.user_id) qs.set("user_id", params.user_id);
+    if (params?.platform) qs.set("platform", params.platform);
+    if (params?.unassigned_only) qs.set("unassigned_only", "true");
+    return fetchJSON<IdentityRecord[]>(`/api/admin/identities?${qs.toString()}`);
+  },
+  cpAddIdentity: (body: { user_id: string; platform: string; external_id: string; external_id_alt?: string; display_name?: string }) =>
+    fetchJSON<IdentityRecord>("/api/admin/identities", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  cpRemoveIdentity: (identityId: string) =>
+    fetchJSON<{ ok: boolean }>(`/api/admin/identities/${encodeURIComponent(identityId)}`, { method: "DELETE" }),
+  cpTransferIdentity: (identityId: string, new_user_id: string) =>
+    fetchJSON<IdentityRecord>(`/api/admin/identities/${encodeURIComponent(identityId)}/transfer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ new_user_id }),
+    }),
+
+  // ── Control Panel: Admin — Group Owners ──────────────────────────────
+  cpListGroupOwners: (params?: { platform?: string; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.platform) qs.set("platform", params.platform);
+    if (params?.limit) qs.set("limit", String(params.limit ?? 200));
+    return fetchJSON<GroupOwnerRecord[]>(`/api/admin/group-owners?${qs.toString()}`);
+  },
+  cpReassignGroupOwner: (groupId: string, body: { new_external_id: string; new_external_id_alt?: string; notes?: string }) =>
+    fetchJSON<GroupOwnerRecord>(`/api/admin/group-owners/${encodeURIComponent(groupId)}/reassign`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
 };
 
 export interface ActionResponse {
@@ -402,6 +500,7 @@ export interface SessionInfo {
   output_tokens: number;
   preview: string | null;
   parent_session_id?: string | null;
+  user_id?: string | null;
 }
 
 export interface SessionLatestDescendantResponse {
@@ -416,6 +515,7 @@ export interface PaginatedSessions {
   total: number;
   limit: number;
   offset: number;
+  scope_all?: boolean;
 }
 
 export interface EnvVarInfo {
@@ -822,4 +922,41 @@ export interface AgentPluginUpdateResponse {
 export interface PluginProvidersPutRequest {
   memory_provider?: string;
   context_engine?: string;
+}
+
+// ── Control Panel types ─────────────────────────────────────────────────
+
+export interface ControlUser {
+  id: string;
+  username: string;
+  display_name: string;
+  role: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  last_login_at: string | null;
+}
+
+export interface IdentityRecord {
+  id: string;
+  user_id: string;
+  platform: string;
+  external_id: string;
+  external_id_alt: string | null;
+  display_name: string | null;
+  bound_at: string;
+  bound_by: string | null;
+  username: string | null;
+  user_display_name: string | null;
+}
+
+export interface GroupOwnerRecord {
+  id: string;
+  platform: string;
+  chat_id: string;
+  owner_external_id: string;
+  owner_user_id_alt: string | null;
+  established_at: string;
+  established_session_id: string | null;
+  notes: string | null;
 }

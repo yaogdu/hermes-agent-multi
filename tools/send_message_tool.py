@@ -1783,4 +1783,5 @@ registry.register(
     handler=send_message_tool,
     check_fn=_check_send_message,
     emoji="📨",
+    metadata={"risk_category": "external_action"},
 )

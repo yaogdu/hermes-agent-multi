@@ -523,6 +523,7 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="👥",
+    metadata={"risk_category": "read_only"},
 )
 
 registry.register(
@@ -575,6 +576,7 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="📋",
+    metadata={"risk_category": "read_only"},
 )
 
 registry.register(
@@ -648,6 +650,7 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="✉️",
+    metadata={"risk_category": "external_action"},
 )
 
 
@@ -685,6 +688,7 @@ registry.register(
     check_fn=_check_yuanbao,
     is_async=True,
     emoji="🔍",
+    metadata={"risk_category": "read_only"},
 )
 
 
@@ -733,5 +737,6 @@ registry.register(
     handler=_handle_yb_send_sticker,
     check_fn=_check_yuanbao,
     is_async=True,
+    metadata={"risk_category": "external_action"},
     emoji="🎨",
 )

@@ -80,12 +80,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "metadata",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 metadata=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -96,6 +97,7 @@ class ToolEntry:
         self.description = description
         self.emoji = emoji
         self.max_result_size_chars = max_result_size_chars
+        self.metadata = metadata if isinstance(metadata, dict) else {}
         # Optional zero-arg callable returning a dict of schema overrides
         # applied at get_definitions() time. Use for fields that depend on
         # runtime config (e.g. delegate_task's description must reflect the
@@ -245,6 +247,7 @@ class ToolRegistry:
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
         override: bool = False,
+        metadata: dict | None = None,
     ):
         """Register a tool.  Called at module-import time by each tool file.
 
@@ -299,6 +302,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                metadata=metadata,
             )
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
@@ -441,6 +445,16 @@ class ToolRegistry:
         """
         entry = self.get_entry(name)
         return entry.schema if entry else None
+
+    def get_metadata(self, name: str) -> dict:
+        """Return a registered tool's policy/runtime metadata.
+
+        Metadata is intentionally kept separate from the model-facing tool
+        schema returned by get_definitions(); it is for runtime governance,
+        UI, audit, and policy engines.
+        """
+        entry = self.get_entry(name)
+        return dict(entry.metadata) if entry else {}
 
     def get_toolset_for_tool(self, name: str) -> Optional[str]:
         """Return the toolset a tool belongs to, or None."""

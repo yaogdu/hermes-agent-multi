@@ -1531,6 +1531,7 @@ registry.register(
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
+    metadata={"risk_category": "read_only"},
 )
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
@@ -1564,4 +1565,5 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
+    metadata={"risk_category": "read_only"},
 )

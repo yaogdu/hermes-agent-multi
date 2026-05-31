@@ -2529,4 +2529,5 @@ registry.register(
         output_path=args.get("output_path")),
     check_fn=check_tts_requirements,
     emoji="🔊",
+    metadata={"risk_category": "external_action"},
 )

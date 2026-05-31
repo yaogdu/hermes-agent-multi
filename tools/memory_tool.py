@@ -717,8 +717,8 @@ registry.register(
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",
+    metadata={"risk_category": "write"},
 )
-
 
 
 

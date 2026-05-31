@@ -47,6 +47,15 @@ import uuid
 _IS_WINDOWS = platform.system() == "Windows"
 from typing import Any, Dict, List, Optional
 
+from tools.tool_policy import (
+    get_current_tool_policy_configs,
+    get_current_tool_policy,
+    reset_current_tool_policy_configs,
+    reset_current_tool_policy,
+    set_current_tool_policy_configs,
+    set_current_tool_policy,
+)
+
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see
 # ``_use_tcp_rpc`` in ``_execute_local`` below.  That makes execute_code
@@ -443,6 +452,8 @@ def _rpc_server_loop(
     tool_call_counter: list,   # mutable [int] so the thread can increment
     max_tool_calls: int,
     allowed_tools: frozenset,
+    tool_policy: str = "standard",
+    tool_policy_configs: Optional[Dict[str, Any]] = None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -450,6 +461,8 @@ def _rpc_server_loop(
     """
     from model_tools import handle_function_call
 
+    policy_token = set_current_tool_policy(tool_policy)
+    policy_configs_token = set_current_tool_policy_configs(tool_policy_configs)
     conn = None
     try:
         server_sock.settimeout(5)
@@ -554,6 +567,8 @@ def _rpc_server_loop(
                 conn.close()
             except OSError as e:
                 logger.debug("RPC conn close error: %s", e)
+        reset_current_tool_policy_configs(policy_configs_token)
+        reset_current_tool_policy(policy_token)
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +720,8 @@ def _rpc_poll_loop(
     max_tool_calls: int,
     allowed_tools: frozenset,
     stop_event: threading.Event,
+    tool_policy: str = "standard",
+    tool_policy_configs: Optional[Dict[str, Any]] = None,
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -714,134 +731,143 @@ def _rpc_poll_loop(
     """
     from model_tools import handle_function_call
 
-    poll_interval = 0.1  # 100 ms
+    policy_token = set_current_tool_policy(tool_policy)
+    policy_configs_token = set_current_tool_policy_configs(tool_policy_configs)
+    try:
+        poll_interval = 0.1  # 100 ms
 
-    quoted_rpc_dir = shlex.quote(rpc_dir)
-    while not stop_event.is_set():
-        try:
-            # List pending request files (skip .tmp partials)
-            ls_result = env.execute(
-                f"ls -1 {quoted_rpc_dir}/req_* 2>/dev/null || true",
-                cwd="/",
-                timeout=10,
-            )
-            output = ls_result.get("output", "").strip()
-            if not output:
-                stop_event.wait(poll_interval)
-                continue
-
-            req_files = sorted([
-                f.strip() for f in output.split("\n")
-                if f.strip()
-                and not f.strip().endswith(".tmp")
-                and "/req_" in f.strip()
-            ])
-
-            for req_file in req_files:
-                if stop_event.is_set():
-                    break
-
-                call_start = time.monotonic()
-
-                quoted_req_file = shlex.quote(req_file)
-                # Read request
-                read_result = env.execute(
-                    f"cat {quoted_req_file}",
+        quoted_rpc_dir = shlex.quote(rpc_dir)
+        while not stop_event.is_set():
+            try:
+                # List pending request files (skip .tmp partials)
+                ls_result = env.execute(
+                    f"ls -1 {quoted_rpc_dir}/req_* 2>/dev/null || true",
                     cwd="/",
                     timeout=10,
                 )
-                try:
-                    request = json.loads(read_result.get("output", ""))
-                except (json.JSONDecodeError, ValueError):
-                    logger.debug("Malformed RPC request in %s", req_file)
-                    # Remove bad request to avoid infinite retry
-                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                output = ls_result.get("output", "").strip()
+                if not output:
+                    stop_event.wait(poll_interval)
                     continue
 
-                tool_name = request.get("tool", "")
-                tool_args = request.get("args", {})
-                seq = request.get("seq", 0)
-                seq_str = f"{seq:06d}"
-                res_file = f"{rpc_dir}/res_{seq_str}"
-                quoted_res_file = shlex.quote(res_file)
+                req_files = sorted([
+                    f.strip() for f in output.split("\n")
+                    if f.strip()
+                    and not f.strip().endswith(".tmp")
+                    and "/req_" in f.strip()
+                ])
 
-                # Enforce allow-list
-                if tool_name not in allowed_tools:
-                    available = ", ".join(sorted(allowed_tools))
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool '{tool_name}' is not available in execute_code. "
-                            f"Available: {available}"
-                        )
-                    })
-                # Enforce tool call limit
-                elif tool_call_counter[0] >= max_tool_calls:
-                    tool_result = json.dumps({
-                        "error": (
-                            f"Tool call limit reached ({max_tool_calls}). "
-                            "No more tool calls allowed in this execution."
-                        )
-                    })
-                else:
-                    # Strip forbidden terminal parameters
-                    if tool_name == "terminal" and isinstance(tool_args, dict):
-                        for param in _TERMINAL_BLOCKED_PARAMS:
-                            tool_args.pop(param, None)
+                for req_file in req_files:
+                    if stop_event.is_set():
+                        break
 
-                    # Dispatch through the standard tool handler
+                    call_start = time.monotonic()
+
+                    quoted_req_file = shlex.quote(req_file)
+                    # Read request
+                    read_result = env.execute(
+                        f"cat {quoted_req_file}",
+                        cwd="/",
+                        timeout=10,
+                    )
                     try:
-                        _real_stdout, _real_stderr = sys.stdout, sys.stderr
-                        devnull = open(os.devnull, "w", encoding="utf-8")
-                        try:
-                            sys.stdout = devnull
-                            sys.stderr = devnull
-                            tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                        request = json.loads(read_result.get("output", ""))
+                    except (json.JSONDecodeError, ValueError):
+                        logger.debug("Malformed RPC request in %s", req_file)
+                        # Remove bad request to avoid infinite retry
+                        env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                        continue
+
+                    tool_name = request.get("tool", "")
+                    tool_args = request.get("args", {})
+                    seq = request.get("seq", 0)
+                    seq_str = f"{seq:06d}"
+                    res_file = f"{rpc_dir}/res_{seq_str}"
+                    quoted_res_file = shlex.quote(res_file)
+
+                    # Enforce allow-list
+                    if tool_name not in allowed_tools:
+                        available = ", ".join(sorted(allowed_tools))
+                        tool_result = json.dumps({
+                            "error": (
+                                f"Tool '{tool_name}' is not available in execute_code. "
+                                f"Available: {available}"
                             )
-                        finally:
-                            sys.stdout, sys.stderr = _real_stdout, _real_stderr
-                            devnull.close()
-                    except Exception as exc:
-                        logger.error("Tool call failed in remote sandbox: %s",
-                                     exc, exc_info=True)
-                        tool_result = tool_error(str(exc))
+                        })
+                    # Enforce tool call limit
+                    elif tool_call_counter[0] >= max_tool_calls:
+                        tool_result = json.dumps({
+                            "error": (
+                                f"Tool call limit reached ({max_tool_calls}). "
+                                "No more tool calls allowed in this execution."
+                            )
+                        })
+                    else:
+                        # Strip forbidden terminal parameters
+                        if tool_name == "terminal" and isinstance(tool_args, dict):
+                            for param in _TERMINAL_BLOCKED_PARAMS:
+                                tool_args.pop(param, None)
 
-                    tool_call_counter[0] += 1
-                    call_duration = time.monotonic() - call_start
-                    tool_call_log.append({
-                        "tool": tool_name,
-                        "args_preview": str(tool_args)[:80],
-                        "duration": round(call_duration, 2),
-                    })
+                        # Dispatch through the standard tool handler
+                        try:
+                            _real_stdout, _real_stderr = sys.stdout, sys.stderr
+                            devnull = open(os.devnull, "w", encoding="utf-8")
+                            try:
+                                sys.stdout = devnull
+                                sys.stderr = devnull
+                                tool_result = handle_function_call(
+                                    tool_name, tool_args, task_id=task_id
+                                )
+                            finally:
+                                sys.stdout, sys.stderr = _real_stdout, _real_stderr
+                                devnull.close()
+                        except Exception as exc:
+                            logger.error("Tool call failed in remote sandbox: %s",
+                                         exc, exc_info=True)
+                            tool_result = tool_error(str(exc))
 
-                # Write response atomically (tmp + rename).
-                # Use echo piping (not stdin_data) because Modal doesn't
-                # reliably deliver stdin to chained commands.
-                encoded_result = base64.b64encode(
-                    tool_result.encode("utf-8")
-                ).decode("ascii")
-                env.execute(
-                    f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
-                    f" && mv {quoted_res_file}.tmp {quoted_res_file}",
-                    cwd="/",
-                    timeout=60,
-                )
+                        tool_call_counter[0] += 1
+                        call_duration = time.monotonic() - call_start
+                        tool_call_log.append({
+                            "tool": tool_name,
+                            "args_preview": str(tool_args)[:80],
+                            "duration": round(call_duration, 2),
+                        })
 
-                # Remove the request file
-                env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+                    # Write response atomically (tmp + rename).
+                    # Use echo piping (not stdin_data) because Modal doesn't
+                    # reliably deliver stdin to chained commands.
+                    encoded_result = base64.b64encode(
+                        tool_result.encode("utf-8")
+                    ).decode("ascii")
+                    env.execute(
+                        f"echo '{encoded_result}' | base64 -d > {quoted_res_file}.tmp"
+                        f" && mv {quoted_res_file}.tmp {quoted_res_file}",
+                        cwd="/",
+                        timeout=60,
+                    )
 
-        except Exception as e:
+                    # Remove the request file
+                    env.execute(f"rm -f {quoted_req_file}", cwd="/", timeout=5)
+
+            except Exception as e:
+                if not stop_event.is_set():
+                    logger.debug("RPC poll error: %s", e, exc_info=True)
+
             if not stop_event.is_set():
-                logger.debug("RPC poll error: %s", e, exc_info=True)
-
-        if not stop_event.is_set():
-            stop_event.wait(poll_interval)
+                stop_event.wait(poll_interval)
+    finally:
+        reset_current_tool_policy_configs(policy_configs_token)
+        reset_current_tool_policy(policy_token)
 
 
 def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    *,
+    tool_policy: str = "standard",
+    tool_policy_configs: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -910,7 +936,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event,
+                sandbox_tools, stop_event, tool_policy, tool_policy_configs,
             ),
             daemon=True,
         )
@@ -1063,11 +1089,20 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    tool_policy = get_current_tool_policy()
+    tool_policy_configs = dict(get_current_tool_policy_configs())
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(
+            code,
+            task_id,
+            enabled_tools,
+            tool_policy=tool_policy,
+            tool_policy_configs=tool_policy_configs,
+        )
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1157,6 +1192,7 @@ def execute_code(
             args=(
                 server_sock, task_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools,
+                tool_policy, tool_policy_configs,
             ),
             daemon=True,
         )
@@ -1780,4 +1816,5 @@ registry.register(
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,
+    metadata={"risk_category": "external_action"},
 )

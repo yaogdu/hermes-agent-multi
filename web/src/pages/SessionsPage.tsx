@@ -50,6 +50,7 @@ import { useI18n } from "@/i18n";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
+import { useAuth } from "@/contexts/AuthContext";
 
 const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
   {
@@ -263,6 +264,7 @@ function SessionRow({
   onToggle,
   onDelete,
   resumeInChatEnabled,
+  showUserId = false,
 }: {
   session: SessionInfo;
   snippet?: string;
@@ -271,6 +273,7 @@ function SessionRow({
   onToggle: () => void;
   onDelete: () => void;
   resumeInChatEnabled: boolean;
+  showUserId?: boolean;
 }) {
   const [messages, setMessages] = useState<SessionMessage[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -385,6 +388,17 @@ function SessionRow({
                 )}
                 <span className="text-border">&#183;</span>
                 <span className="shrink-0">{timeAgo(session.last_active)}</span>
+                {showUserId && session.user_id && (
+                  <>
+                    <span className="text-border">&#183;</span>
+                    <span
+                      className="shrink-0 max-w-[120px] truncate text-text-tertiary font-mono-ui"
+                      title={session.user_id}
+                    >
+                      {session.user_id}
+                    </span>
+                  </>
+                )}
               </div>
               {snippet && <SnippetHighlight snippet={snippet} />}
             </div>
@@ -487,6 +501,7 @@ export default function SessionsPage() {
     SessionSearchResult[] | null
   >(null);
   const [searching, setSearching] = useState(false);
+  const [scopeAll, setScopeAll] = useState(true);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
   const logScrollRef = useRef<HTMLPreElement | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -497,6 +512,7 @@ export default function SessionsPage() {
   const { setAfterTitle } = usePageHeader();
   const { activeAction, actionStatus, dismissLog } = useSystemActions();
   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
+  const { isAdmin } = useAuth();
 
   useLayoutEffect(() => {
     if (loading) {
@@ -520,6 +536,7 @@ export default function SessionsPage() {
       .then((resp) => {
         setSessions(resp.sessions);
         setTotal(resp.total);
+        setScopeAll(resp.scope_all ?? true);
       })
       .catch(() => {})
       .finally(() => setLoading(false));
@@ -809,6 +826,12 @@ export default function SessionsPage() {
                 )}
               </div>
             )}
+
+            {!scopeAll && (
+              <Badge tone="warning" className="text-xs shrink-0">
+                Scoped view
+              </Badge>
+            )}
           </div>
 
           {showPagination && (
@@ -851,6 +874,7 @@ export default function SessionsPage() {
                   }
                   onDelete={() => sessionDelete.requestDelete(s.id)}
                   resumeInChatEnabled={resumeInChatEnabled}
+                  showUserId={isAdmin}
                 />
               ))}
             </div>

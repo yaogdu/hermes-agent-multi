@@ -1,7 +1,16 @@
 """Regression tests for memory provider selection during AIAgent init."""
 
 from types import SimpleNamespace
+import sys
+import types
+import unittest
 from unittest.mock import patch
+
+if "yaml" not in sys.modules:
+    yaml_stub = types.ModuleType("yaml")
+    yaml_stub.safe_load = lambda stream: {}
+    yaml_stub.safe_dump = lambda data, *args, **kwargs: str(data)
+    sys.modules["yaml"] = yaml_stub
 
 
 def test_blank_memory_provider_does_not_auto_enable_honcho():
@@ -37,3 +46,58 @@ def test_blank_memory_provider_does_not_auto_enable_honcho():
     load_memory_provider.assert_not_called()
     save_config.assert_not_called()
 
+
+class TestRoleMemoryGovernance(unittest.TestCase):
+    def test_role_memory_scope_flows_to_memory_provider(self):
+        from agent.runtime_governance import (
+            normalize_agent_key,
+            normalize_memory_scope,
+            role_scoped_gateway_session_key,
+            role_scoped_identity,
+        )
+
+        agent_key = normalize_agent_key("Ops Agent")
+        memory_scope = normalize_memory_scope("role-user-session")
+
+        self.assertEqual(agent_key, "ops-agent")
+        self.assertEqual(memory_scope, "role_user_session")
+        self.assertEqual(
+            role_scoped_gateway_session_key(
+                "agent:ops:feishu:group:room-1",
+                agent_key=agent_key,
+                memory_scope=memory_scope,
+            ),
+            "agent:ops:feishu:group:room-1",
+        )
+        self.assertEqual(
+            role_scoped_identity("default", agent_key=agent_key, memory_scope=memory_scope),
+            "default:ops-agent",
+        )
+
+    def test_role_global_memory_scope_uses_role_global_session_key(self):
+        from agent.runtime_governance import (
+            normalize_agent_key,
+            normalize_memory_scope,
+            role_scoped_gateway_session_key,
+            role_scoped_identity,
+        )
+
+        agent_key = normalize_agent_key("ops")
+        memory_scope = normalize_memory_scope("role_global")
+
+        self.assertEqual(
+            role_scoped_gateway_session_key(
+                "agent:ops:feishu:group:room-1",
+                agent_key=agent_key,
+                memory_scope=memory_scope,
+            ),
+            "agent:ops:global",
+        )
+        self.assertEqual(
+            role_scoped_identity("default", agent_key=agent_key, memory_scope=memory_scope),
+            "default:ops",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

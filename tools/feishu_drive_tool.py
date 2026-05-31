@@ -392,6 +392,7 @@ registry.register(
     is_async=False,
     description="List document comments",
     emoji="\U0001f4ac",
+    metadata={"risk_category": "read_only"},
 )
 
 registry.register(
@@ -404,6 +405,7 @@ registry.register(
     is_async=False,
     description="List comment replies",
     emoji="\U0001f4ac",
+    metadata={"risk_category": "read_only"},
 )
 
 registry.register(
@@ -416,6 +418,7 @@ registry.register(
     is_async=False,
     description="Reply to a document comment",
     emoji="\u2709\ufe0f",
+    metadata={"risk_category": "external_action"},
 )
 
 registry.register(
@@ -428,4 +431,5 @@ registry.register(
     is_async=False,
     description="Add a whole-document comment",
     emoji="\u2709\ufe0f",
+    metadata={"risk_category": "external_action"},
 )

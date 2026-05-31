@@ -523,4 +523,5 @@ registry.register(
     requires_env=["XAI_API_KEY"],
     emoji="🐦",
     max_result_size_chars=100_000,
+    metadata={"risk_category": "read_only"},
 )

@@ -3278,7 +3278,7 @@ class BasePlatformAdapter(ABC):
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
-        
+
         This method returns quickly by spawning background tasks.
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
@@ -4064,26 +4064,80 @@ class BasePlatformAdapter(ABC):
         guild_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
+        user_metadata: Optional[dict] = None,
     ) -> SessionSource:
-        """Helper to build a SessionSource for this platform."""
+        """Helper to build a SessionSource for this platform.
+
+        Cross-platform group-ownership hook: for non-DM chats, the first human
+        whose message reaches build_source claims the chat as owner. Every
+        subsequent session in the same chat is attributed to that owner's
+        external_id, so a multi-tenant Control Panel can show one human their
+        group history without mixing in everyone else.
+
+        Why here (not in each platform adapter): build_source is the single
+        chokepoint every platform passes through to construct a SessionSource.
+        Putting the hook here means feishu/telegram/discord/slack/wecom/...
+        all get the behavior for free, and the rule stays consistent across
+        channels.
+        """
         # Normalize empty topic to None
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
+
+        effective_user_id = str(user_id) if user_id else None
+        effective_user_id_alt = user_id_alt
+
+        # Identity-tracking hooks (cross-platform). Both are best-effort and
+        # never break message handling.
+        if not is_bot and effective_user_id:
+            # 1. Refresh display_name in the Control Panel so admins see
+            #    "ou_xxx (张三)" instead of an opaque external_id. Runs for
+            #    every channel and every chat_type (DM included).
+            try:
+                from gateway.group_owner_resolver import upsert_identity_display_name
+                upsert_identity_display_name(
+                    platform=self.platform,
+                    external_id=effective_user_id,
+                    display_name=user_name,
+                    user_id_alt=effective_user_id_alt,
+                    metadata=user_metadata,
+                )
+            except Exception:
+                pass
+
+            # 2. Group-ownership rewrite: first human in a non-DM chat claims
+            #    the chat; later sessions in the same chat are attributed to
+            #    that owner. DMs are skipped — only one participant anyway.
+            if chat_type and chat_type != "dm":
+                try:
+                    from gateway.group_owner_resolver import resolve_or_claim_group_owner
+                    effective_user_id, effective_user_id_alt = resolve_or_claim_group_owner(
+                        platform=self.platform,
+                        chat_id=str(chat_id),
+                        candidate_external_id=effective_user_id,
+                        candidate_user_id_alt=effective_user_id_alt,
+                    )
+                except Exception:
+                    pass
+
         return SessionSource(
             platform=self.platform,
             chat_id=str(chat_id),
             chat_name=chat_name,
             chat_type=chat_type,
-            user_id=str(user_id) if user_id else None,
+            user_id=effective_user_id,
             user_name=user_name,
             thread_id=str(thread_id) if thread_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
-            user_id_alt=user_id_alt,
+            user_id_alt=effective_user_id_alt,
             chat_id_alt=chat_id_alt,
             is_bot=is_bot,
             guild_id=str(guild_id) if guild_id else None,
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
+            # Preserve the unmodified sender id so /whoami and audit views can
+            # show "you" rather than the group owner after the hook rewrites.
+            original_user_id=str(user_id) if user_id else None,
         )
     
     @abstractmethod

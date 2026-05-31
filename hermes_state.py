@@ -1183,6 +1183,7 @@ class SessionDB:
         include_children: bool = False,
         project_compression_tips: bool = True,
         order_by_last_active: bool = False,
+        user_ids: List[str] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -1235,6 +1236,11 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+
+        if user_ids:
+            placeholders = ",".join("?" for _ in user_ids)
+            where_clauses.append(f"s.user_id IN ({placeholders})")
+            params.extend(user_ids)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         if order_by_last_active:
@@ -2456,12 +2462,24 @@ class SessionDB:
     # Utility
     # =========================================================================
 
-    def session_count(self, source: str = None) -> int:
-        """Count sessions, optionally filtered by source."""
+    def session_count(self, source: str = None, user_ids: List[str] = None) -> int:
+        """Count sessions, optionally filtered by source and/or user IDs."""
         with self._lock:
-            if source:
+            if source and user_ids:
+                placeholders = ",".join("?" for _ in user_ids)
+                cursor = self._conn.execute(
+                    f"SELECT COUNT(*) FROM sessions WHERE source = ? AND user_id IN ({placeholders})",
+                    (source,) + tuple(user_ids),
+                )
+            elif source:
                 cursor = self._conn.execute(
                     "SELECT COUNT(*) FROM sessions WHERE source = ?", (source,)
+                )
+            elif user_ids:
+                placeholders = ",".join("?" for _ in user_ids)
+                cursor = self._conn.execute(
+                    f"SELECT COUNT(*) FROM sessions WHERE user_id IN ({placeholders})",
+                    tuple(user_ids),
                 )
             else:
                 cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")

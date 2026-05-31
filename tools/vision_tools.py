@@ -1070,6 +1070,7 @@ registry.register(
     check_fn=check_vision_requirements,
     is_async=True,
     emoji="👁️",
+    metadata={"risk_category": "read_only"},
 )
 
 
@@ -1433,4 +1434,5 @@ registry.register(
     check_fn=check_vision_requirements,
     is_async=True,
     emoji="🎬",
+    metadata={"risk_category": "read_only"},
 )

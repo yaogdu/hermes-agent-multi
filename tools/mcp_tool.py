@@ -2847,6 +2847,47 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     }
 
 
+def _mcp_annotations_to_dict(value) -> dict:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    result = {}
+    for key in (
+        "readOnlyHint",
+        "read_only_hint",
+        "destructiveHint",
+        "destructive_hint",
+        "idempotentHint",
+        "idempotent_hint",
+        "openWorldHint",
+        "open_world_hint",
+    ):
+        if hasattr(value, key):
+            result[key] = getattr(value, key)
+    try:
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                result.update(dumped)
+    except Exception:
+        pass
+    return result
+
+
+def _mcp_tool_metadata(server_name: str, mcp_tool, *, utility_read_only: bool = False) -> dict:
+    annotations = _mcp_annotations_to_dict(getattr(mcp_tool, "annotations", None))
+    if utility_read_only:
+        annotations = {**annotations, "readOnlyHint": True}
+    return {
+        "source": "mcp",
+        "mcp_server": server_name,
+        "mcp_tool": getattr(mcp_tool, "name", ""),
+        "annotations": annotations,
+    }
+
+
 def _build_utility_schemas(server_name: str) -> List[dict]:
     """Build schemas for the MCP utility tools (resources & prompts).
 
@@ -3119,6 +3160,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],
+            metadata=_mcp_tool_metadata(name, mcp_tool),
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
         registered_names.append(tool_name_prefixed)
@@ -3156,6 +3198,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            metadata={
+                "source": "mcp",
+                "mcp_server": name,
+                "mcp_utility": handler_key,
+                "annotations": {"readOnlyHint": True},
+            },
         )
         _track_mcp_tool_server(util_name, name)
         registered_names.append(util_name)

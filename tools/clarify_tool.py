@@ -138,4 +138,5 @@ registry.register(
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
     emoji="❓",
+    metadata={"risk_category": "external_action"},
 )

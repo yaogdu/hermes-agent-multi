@@ -88,6 +88,8 @@ export interface Translations {
       config: string;
       cron: string;
       documentation: string;
+      groupOwners: string;
+      identities: string;
       keys: string;
       logs: string;
       models: string;
@@ -95,6 +97,7 @@ export interface Translations {
       plugins: string;
       sessions: string;
       skills: string;
+      users: string;
     };
     modelToolsSheetSubtitle: string;
     modelToolsSheetTitle: string;

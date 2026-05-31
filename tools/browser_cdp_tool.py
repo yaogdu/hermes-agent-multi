@@ -567,4 +567,5 @@ registry.register(
     ),
     check_fn=_browser_cdp_check,
     emoji="🧪",
+    metadata={"risk_category": "external_action"},
 )

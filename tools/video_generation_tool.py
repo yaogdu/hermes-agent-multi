@@ -558,4 +558,5 @@ registry.register(
     is_async=False,
     emoji="🎬",
     dynamic_schema_overrides=_build_dynamic_video_schema,
+    metadata={"risk_category": "external_action"},
 )

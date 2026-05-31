@@ -28,6 +28,7 @@ import {
   Globe,
   Heart,
   KeyRound,
+  Link,
   Menu,
   MessageSquare,
   Package,
@@ -67,6 +68,11 @@ import ProfilesPage from "@/pages/ProfilesPage";
 import SkillsPage from "@/pages/SkillsPage";
 import PluginsPage from "@/pages/PluginsPage";
 import ChatPage from "@/pages/ChatPage";
+import LoginPage from "@/pages/LoginPage";
+import UsersPage from "@/pages/admin/UsersPage";
+import IdentitiesPage from "@/pages/admin/IdentitiesPage";
+import GroupOwnersPage from "@/pages/admin/GroupOwnersPage";
+import { useAuth } from "@/contexts/AuthContext";
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -118,6 +124,9 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/config": ConfigPage,
   "/env": EnvPage,
   "/docs": DocsPage,
+  "/admin/users": UsersPage,
+  "/admin/identities": IdentitiesPage,
+  "/admin/group-owners": GroupOwnersPage,
 };
 
 // Route placeholder for /chat.  The persistent ChatPage host (rendered
@@ -159,6 +168,27 @@ const BUILTIN_NAV_REST: NavItem[] = [
     labelKey: "documentation",
     label: "Documentation",
     icon: BookOpen,
+  },
+];
+
+const ADMIN_NAV_ITEMS: NavItem[] = [
+  {
+    path: "/admin/users",
+    labelKey: "users",
+    label: "Users",
+    icon: Users,
+  },
+  {
+    path: "/admin/identities",
+    labelKey: "identities",
+    label: "Identities",
+    icon: Link,
+  },
+  {
+    path: "/admin/group-owners",
+    labelKey: "groupOwners",
+    label: "Group Owners",
+    icon: Users,
   },
 ];
 
@@ -310,8 +340,10 @@ export default function App() {
   const { pathname } = useLocation();
   const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
+  const { loading: authLoading, user } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
+
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
@@ -365,13 +397,17 @@ export default function App() {
   );
 
   const builtinNav = useMemo(() => {
-    const base = embeddedChat
+    let base = embeddedChat
       ? [CHAT_NAV_ITEM, ...BUILTIN_NAV_REST]
       : BUILTIN_NAV_REST;
-    return showTokenAnalytics
-      ? base
-      : base.filter((n) => n.path !== "/analytics");
-  }, [embeddedChat, showTokenAnalytics]);
+    if (!showTokenAnalytics) {
+      base = base.filter((n) => n.path !== "/analytics");
+    }
+    if (user?.role === "admin") {
+      base = [...base, ...ADMIN_NAV_ITEMS];
+    }
+    return base;
+  }, [embeddedChat, showTokenAnalytics, user]);
 
   const sidebarNav = useMemo(
     () => partitionSidebarNav(builtinNav, manifests),
@@ -416,6 +452,21 @@ export default function App() {
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
   }, []);
+
+  // Auth gate: show login page while checking or when not authenticated.
+  if (authLoading) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-black">
+        <div className="flex items-center gap-3 text-text-secondary">
+          <Spinner />
+          <span className="font-mono-ui text-sm">Loading…</span>
+        </div>
+      </div>
+    );
+  }
+  if (!user) {
+    return <LoginPage />;
+  }
 
   return (
     <div
