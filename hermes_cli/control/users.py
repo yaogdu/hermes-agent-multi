@@ -8,12 +8,10 @@ from __future__ import annotations
 
 import os
 import re
-import sqlite3
-from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
 
 from .auth import PasswordHasher
+from .database import Database
 
 _USERNAME_RE = re.compile(r"^[a-z0-9_.-]{2,32}$")
 _VALID_ROLES = {"user", "admin"}
@@ -60,7 +58,7 @@ def _validate_status(status: str) -> str:
 
 
 def create_user(
-    db_path: Path,
+    db: Database,
     *,
     username: str,
     password: str,
@@ -76,42 +74,37 @@ def create_user(
     user_id = f"usr_{os.urandom(8).hex()}"
     now = _now()
     display = (display_name or username).strip() or norm_username
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        try:
-            with conn:
-                conn.execute(
-                    """
-                    insert into users
-                      (id, username, password_hash, display_name, role, status,
-                       created_at, updated_at, password_changed_at)
-                    values (?, ?, ?, ?, ?, 'active', ?, ?, ?)
-                    """,
-                    (user_id, norm_username, hasher.hash(password), display, norm_role, now, now, now),
-                )
-        except sqlite3.IntegrityError as e:
-            msg = str(e).lower()
-            if "unique" in msg or "username" in msg:
-                raise ValueError(f"username '{norm_username}' already exists")
-            raise
-    return get_user(db_path, user_id)  # type: ignore
-
-
-def get_user(db_path: Path, user_id: str) -> dict | None:
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
+    try:
+        db.execute(
             """
-            select id, username, display_name, role, status,
-                   created_at, updated_at, last_login_at
-            from users where id = ?
+            insert into users
+              (id, username, password_hash, display_name, role, status,
+               created_at, updated_at, password_changed_at)
+            values (?, ?, ?, ?, ?, 'active', ?, ?, ?)
             """,
-            (user_id,),
-        ).fetchone()
-    return dict(row) if row else None
+            (user_id, norm_username, hasher.hash(password), display, norm_role, now, now, now),
+        )
+    except Exception as e:
+        msg = str(e).lower()
+        if "unique" in msg or "username" in msg or "duplicate" in msg:
+            raise ValueError(f"username '{norm_username}' already exists")
+        raise
+    return get_user(db, user_id)  # type: ignore
+
+
+def get_user(db: Database, user_id: str) -> dict | None:
+    return db.fetchone(
+        """
+        select id, username, display_name, role, status,
+               created_at, updated_at, last_login_at
+        from users where id = ?
+        """,
+        (user_id,),
+    )
 
 
 def list_users(
-    db_path: Path,
+    db: Database,
     *,
     role: str | None = None,
     status: str | None = None,
@@ -133,22 +126,19 @@ def list_users(
     clauses.append("order by username asc")
     clauses.append("limit ? offset ?")
     params.extend([limit, offset])
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            f"""
-            select id, username, display_name, role, status,
-                   created_at, updated_at, last_login_at
-            from users
-            {' '.join(clauses)}
-            """,
-            params,
-        ).fetchall()
-    return [dict(r) for r in rows]
+    return db.fetchall(
+        f"""
+        select id, username, display_name, role, status,
+               created_at, updated_at, last_login_at
+        from users
+        {' '.join(clauses)}
+        """,
+        tuple(params),
+    )
 
 
 def update_user(
-    db_path: Path,
+    db: Database,
     user_id: str,
     *,
     role: str | None = None,
@@ -159,7 +149,7 @@ def update_user(
     hasher: PasswordHasher | None = None,
 ) -> dict | None:
     """Update user fields. password=None means don't change password."""
-    existing = get_user(db_path, user_id)
+    existing = get_user(db, user_id)
     if not existing:
         return None
     now = _now()
@@ -182,17 +172,15 @@ def update_user(
         params.append(hasher.hash(password))
         params.append(now)
     params.append(user_id)
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        with conn:
-            conn.execute(
-                f"update users set {', '.join(sets)} where id = ?",
-                params,
-            )
-    return get_user(db_path, user_id)
+    db.execute(
+        f"update users set {', '.join(sets)} where id = ?",
+        tuple(params),
+    )
+    return get_user(db, user_id)
 
 
 def count_users(
-    db_path: Path,
+    db: Database,
     *,
     role: str | None = None,
     status: str | None = None,
@@ -205,19 +193,18 @@ def count_users(
     if status:
         clauses.append("and status = ?")
         params.append(status)
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        row = conn.execute(
-            f"select count(*) from users {' '.join(clauses)}",
-            params,
-        ).fetchone()
-    return int(row[0]) if row else 0
+    row = db.fetchone(
+        f"select count(*) as cnt from users {' '.join(clauses)}",
+        tuple(params),
+    )
+    return int(row["cnt"]) if row else 0
 
 
 # ── Identity binding ─────────────────────────────────────────────────────────
 
 
 def list_identities(
-    db_path: Path,
+    db: Database,
     *,
     user_id: str | None = None,
     platform: str | None = None,
@@ -234,24 +221,21 @@ def list_identities(
     if unassigned_only:
         clauses.append("and i.user_id = 'usr_system'")
     clauses.append("order by i.platform, i.external_id")
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            f"""
-            select i.id, i.user_id, i.platform, i.external_id, i.external_id_alt,
-                   i.display_name, i.bound_at, i.bound_by,
-                   u.username, u.display_name as user_display_name
-            from user_identities i
-            left join users u on u.id = i.user_id
-            {' '.join(clauses)}
-            """,
-            params,
-        ).fetchall()
-    return [dict(r) for r in rows]
+    return db.fetchall(
+        f"""
+        select i.id, i.user_id, i.platform, i.external_id, i.external_id_alt,
+               i.display_name, i.bound_at, i.bound_by,
+               u.username, u.display_name as user_display_name
+        from user_identities i
+        left join users u on u.id = i.user_id
+        {' '.join(clauses)}
+        """,
+        tuple(params),
+    )
 
 
 def add_identity(
-    db_path: Path,
+    db: Database,
     *,
     user_id: str,
     platform: str,
@@ -266,64 +250,55 @@ def add_identity(
     now = _now()
     platform = platform.strip().lower()
     external_id = external_id.strip()
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        try:
-            with conn:
-                conn.execute(
-                    """
-                    insert into user_identities
-                      (id, user_id, platform, external_id, external_id_alt,
-                       display_name, bound_at, bound_by)
-                    values (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (identity_id, user_id, platform, external_id, external_id_alt,
-                     display_name, now, bound_by),
-                )
-        except sqlite3.IntegrityError:
-            raise ValueError(f"identity already exists: {platform}/{external_id}")
-    return get_identity(db_path, identity_id)  # type: ignore
+    try:
+        db.execute(
+            """
+            insert into user_identities
+              (id, user_id, platform, external_id, external_id_alt,
+               display_name, bound_at, bound_by)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (identity_id, user_id, platform, external_id, external_id_alt,
+             display_name, now, bound_by),
+        )
+    except Exception:
+        raise ValueError(f"identity already exists: {platform}/{external_id}")
+    return get_identity(db, identity_id)  # type: ignore
 
 
-def remove_identity(db_path: Path, identity_id: str) -> bool:
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        with conn:
-            cur = conn.execute("delete from user_identities where id = ?", (identity_id,))
+def remove_identity(db: Database, identity_id: str) -> bool:
+    cur = db.execute("delete from user_identities where id = ?", (identity_id,))
     return cur.rowcount > 0
 
 
 def transfer_identity(
-    db_path: Path,
+    db: Database,
     identity_id: str,
     new_user_id: str,
     *,
     transferred_by: str = "admin",
 ) -> dict | None:
     """Transfer an identity binding from one user to another."""
-    existing = get_identity(db_path, identity_id)
+    existing = get_identity(db, identity_id)
     if not existing:
         return None
     now = _now()
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        with conn:
-            conn.execute(
-                "update user_identities set user_id = ?, bound_at = ?, bound_by = ? where id = ?",
-                (new_user_id, now, transferred_by, identity_id),
-            )
-    return get_identity(db_path, identity_id)
+    db.execute(
+        "update user_identities set user_id = ?, bound_at = ?, bound_by = ? where id = ?",
+        (new_user_id, now, transferred_by, identity_id),
+    )
+    return get_identity(db, identity_id)
 
 
-def get_identity(db_path: Path, identity_id: str) -> dict | None:
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            select i.id, i.user_id, i.platform, i.external_id, i.external_id_alt,
-                   i.display_name, i.bound_at, i.bound_by,
-                   u.username, u.display_name as user_display_name
-            from user_identities i
-            left join users u on u.id = i.user_id
-            where i.id = ?
-            """,
-            (identity_id,),
-        ).fetchone()
-    return dict(row) if row else None
+def get_identity(db: Database, identity_id: str) -> dict | None:
+    return db.fetchone(
+        """
+        select i.id, i.user_id, i.platform, i.external_id, i.external_id_alt,
+               i.display_name, i.bound_at, i.bound_by,
+               u.username, u.display_name as user_display_name
+        from user_identities i
+        left join users u on u.id = i.user_id
+        where i.id = ?
+        """,
+        (identity_id,),
+    )

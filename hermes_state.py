@@ -16,6 +16,7 @@ Key design decisions:
 
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -25,6 +26,7 @@ from pathlib import Path
 
 from agent.memory_manager import sanitize_context
 from hermes_constants import get_hermes_home
+from hermes_cli.storage import get_storage
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
@@ -308,12 +310,83 @@ END;
 """
 
 
+# ── Shared-DB compatibility adapter ──────────────────────────────────────────
+# Thin wrapper that makes a Database instance look like a sqlite3.Connection
+# so existing SessionDB code works without changes.
+
+
+class _SharedDBCursor:
+    """Wraps Database fetchall() results as a sqlite3.Cursor-like object."""
+
+    def __init__(self, rows: list, rowcount: int = 0, lastrowid: int = 0):
+        self._rows = rows
+        self._idx = 0
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        if self._idx < len(self._rows):
+            row = self._rows[self._idx]
+            self._idx += 1
+            return row
+        return None
+
+    def fetchall(self):
+        remaining = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return remaining
+
+
+class _SharedDBConnectionAdapter:
+    """Wraps a Database so it behaves like sqlite3.Connection.execute()."""
+
+    def __init__(self, db):
+        self._db = db
+
+    def execute(self, sql, params=()):
+        """Execute SQL and return a Cursor-like object."""
+        sql_upper = sql.strip().upper()
+        if sql_upper.startswith(("SELECT", "WITH", "PRAGMA")):
+            rows = self._db.fetchall(sql, params)
+            return _SharedDBCursor(rows, rowcount=len(rows))
+        else:
+            cursor = self._db.execute(sql, params)
+            return _SharedDBCursor([], rowcount=cursor.rowcount, lastrowid=cursor.lastrowid)
+
+    def executemany(self, sql, seq_of_params):
+        for params in seq_of_params:
+            self._db.execute(sql, params)
+
+    def executescript(self, sql):
+        for stmt in sql.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self._db.execute(stmt)
+
+    def commit(self):
+        pass  # Commit is handled by transaction()
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+    def __getattr__(self, name):
+        # Delegate unknown attributes to the underlying db
+        return getattr(self._db, name)
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
 
+    When ``AGENTOPS_DATABASE_URL`` is set to a mysql:// or postgresql:// URL,
+    uses the shared Database abstraction instead of local SQLite — enabling
+    multi-node deployment with a shared database.
+
     Thread-safe for the common gateway pattern (multiple reader threads,
-    single writer via WAL mode). Each method opens its own cursor.
+    single writer via WAL mode for SQLite). Each method opens its own cursor.
     """
 
     # ── Write-contention tuning ──
@@ -331,7 +404,36 @@ class SessionDB:
     # Attempt a PASSIVE WAL checkpoint every N successful writes.
     _CHECKPOINT_EVERY_N_WRITES = 50
 
-    def __init__(self, db_path: Path = None):
+    def __init__(self, db_path: Path = None, db=None):
+        """
+        *db_path*: Path to SQLite state.db (default ~/.hermes/state.db).
+        *db*: a ``hermes_cli.control.database.Database`` instance for MySQL/PG.
+
+        If neither is provided and ``AGENTOPS_DATABASE_URL`` is set, a
+        Database is auto-created from that URL.
+        """
+        # Resolve backend: explicit db > env var > SQLite path
+        self._shared_db: Any = db
+        if self._shared_db is None:
+            database_url = os.environ.get("AGENTOPS_DATABASE_URL", "").strip()
+            if database_url and not database_url.startswith("sqlite://"):
+                try:
+                    from hermes_cli.control.database import Database
+                    self._shared_db = Database(database_url)
+                except Exception:
+                    pass  # fall through to SQLite
+
+        if self._shared_db is not None:
+            # ── Shared-database backend (MySQL / PostgreSQL) ────────────────
+            self._conn = None
+            self._lock = threading.Lock()
+            self._write_count = 0
+            self.db_path = db_path or DEFAULT_DB_PATH
+            self._init_schema_db()
+            return
+
+        # ── SQLite backend (existing code) ──────────────────────────────────
+        self._shared_db = None
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -341,14 +443,7 @@ class SessionDB:
             self._conn = sqlite3.connect(
                 str(self.db_path),
                 check_same_thread=False,
-                # Short timeout — application-level retry with random jitter
-                # handles contention instead of sitting in SQLite's internal
-                # busy handler for up to 30s.
                 timeout=1.0,
-                # Autocommit mode: Python's default isolation_level=""
-                # auto-starts transactions on DML, which conflicts with our
-                # explicit BEGIN IMMEDIATE.  None = we manage transactions
-                # ourselves.
                 isolation_level=None,
             )
             self._conn.row_factory = sqlite3.Row
@@ -357,39 +452,137 @@ class SessionDB:
 
             self._init_schema()
         except Exception as exc:
-            # Capture the cause so /resume and friends can surface WHY the
-            # session DB is unavailable instead of a bare "Session database
-            # not available."  Callers that catch this exception keep their
-            # existing ``self._session_db = None`` degradation path.
-            #
-            # Note: we deliberately do NOT clear _last_init_error on the
-            # success path (no else branch).  In multi-threaded callers
-            # (gateway, web_server per-request SessionDB()), a concurrent
-            # successful open racing past this failure would erase the
-            # cause that another thread's /resume is about to format.
-            # Tests that need to reset the state can call
-            # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
 
+    def _init_schema_db(self):
+        """Initialize state schema on the shared Database backend."""
+        db = self._shared_db
+
+        # sessions table
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+              id VARCHAR(64) PRIMARY KEY,
+              source VARCHAR(32) NOT NULL,
+              user_id VARCHAR(255),
+              model VARCHAR(64),
+              model_config TEXT,
+              system_prompt TEXT,
+              parent_session_id VARCHAR(64),
+              started_at DOUBLE NOT NULL,
+              ended_at DOUBLE,
+              end_reason TEXT,
+              message_count INTEGER DEFAULT 0,
+              tool_call_count INTEGER DEFAULT 0,
+              input_tokens INTEGER DEFAULT 0,
+              output_tokens INTEGER DEFAULT 0,
+              cache_read_tokens INTEGER DEFAULT 0,
+              cache_write_tokens INTEGER DEFAULT 0,
+              reasoning_tokens INTEGER DEFAULT 0,
+              billing_provider VARCHAR(64),
+              billing_base_url TEXT,
+              billing_mode VARCHAR(32),
+              estimated_cost_usd DOUBLE,
+              actual_cost_usd DOUBLE,
+              cost_status VARCHAR(32),
+              cost_source VARCHAR(32),
+              pricing_version VARCHAR(32),
+              title TEXT,
+              api_call_count INTEGER DEFAULT 0,
+              handoff_state VARCHAR(32),
+              handoff_platform VARCHAR(32),
+              handoff_error TEXT
+            )
+        """)
+
+        # messages table
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+              id BIGINT AUTOINCREMENT PRIMARY KEY,
+              session_id VARCHAR(64) NOT NULL,
+              role VARCHAR(32) NOT NULL,
+              content LONGTEXT,
+              tool_call_id VARCHAR(255),
+              tool_calls LONGTEXT,
+              tool_name VARCHAR(255),
+              timestamp DOUBLE NOT NULL,
+              token_count INTEGER,
+              finish_reason VARCHAR(32),
+              reasoning LONGTEXT,
+              reasoning_content LONGTEXT,
+              reasoning_details LONGTEXT,
+              codex_reasoning_items LONGTEXT,
+              codex_message_items LONGTEXT,
+              platform_message_id VARCHAR(255),
+              observed INTEGER DEFAULT 0
+            )
+        """)
+
+        # state_meta table
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS state_meta (
+              `key` VARCHAR(255) PRIMARY KEY,
+              `value` TEXT
+            )
+        """)
+
+        # Indexes
+        for idx_sql in [
+            "CREATE INDEX idx_sessions_source ON sessions(source)",
+            "CREATE INDEX idx_sessions_parent ON sessions(parent_session_id)",
+            "CREATE INDEX idx_sessions_started ON sessions(started_at)",
+            "CREATE INDEX idx_messages_session ON messages(session_id, timestamp)",
+        ]:
+            try:
+                db.execute(idx_sql)
+            except Exception:
+                pass
+
+        # FTS index
+        if db.backend_name == "mysql":
+            db.fulltext_setup("messages", ["content", "tool_name", "tool_calls"])
+
+        # Schema version
+        db.execute(
+            "INSERT IGNORE INTO state_meta (`key`, `value`) VALUES (?, ?)",
+            ("schema_version", str(SCHEMA_VERSION)),
+        )
+
+        # Install a thin adapter so existing code that uses self._conn.execute(...)
+        # works transparently with the shared Database backend
+        self._conn = _SharedDBConnectionAdapter(db)
+
     # ── Core write helper ──
 
-    def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
+    def _query_one(self, sql: str, params=()) -> dict | None:
+        """Fetch one row as dict. Works with both backends via adapter."""
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return dict(row) if row else None
 
-        *fn* receives the connection and should perform INSERT/UPDATE/DELETE
-        statements.  The caller must NOT call ``commit()`` — that's handled
-        here after *fn* returns.
+    def _query_all(self, sql: str, params=()) -> list[dict]:
+        """Fetch all rows as list[dict]. Works with both backends via adapter."""
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
 
-        BEGIN IMMEDIATE acquires the WAL write lock at transaction start
-        (not at commit time), so lock contention surfaces immediately.
-        On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
-        SQLite's built-in deterministic backoff creates.
+    def _execute_write(self, fn):
+        """Execute a write transaction.
 
-        Returns whatever *fn* returns.
+        When using the shared-Database backend (MySQL/PG), delegates to
+        ``db.transaction()`` with the adapter so existing code using
+        ``conn.execute().fetchone()`` works transparently.
+
+        When using SQLite, uses BEGIN IMMEDIATE with jitter retry.
         """
-        last_err: Optional[Exception] = None
+        if self._shared_db is not None:
+            db = self._shared_db
+            adapter = self._conn  # _SharedDBConnectionAdapter
+            with db.transaction():
+                return fn(adapter)
+
+        # ── SQLite backend (existing code) ──────────────────────────────
+        last_err = None
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
                 with self._lock:
@@ -448,11 +641,13 @@ class SessionDB:
             pass  # Best effort — never fatal.
 
     def close(self):
-        """Close the database connection.
+        """Close the database connection."""
+        if self._shared_db is not None:
+            self._shared_db.close()
+            self._shared_db = None
+            self._conn = None
+            return
 
-        Attempts a PASSIVE WAL checkpoint first so that exiting processes
-        help keep the WAL file from growing unbounded.
-        """
         with self._lock:
             if self._conn:
                 try:
@@ -946,12 +1141,9 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM sessions WHERE id = ?", (session_id,)
-            )
-            row = cursor.fetchone()
-        return dict(row) if row else None
+        return self._query_one(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        )
 
     def resolve_session_id(self, session_id_or_prefix: str) -> Optional[str]:
         """Resolve an exact or uniquely prefixed session ID to the full ID.
@@ -1636,12 +1828,10 @@ class SessionDB:
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by insertion order."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
-                (session_id,),
-            )
-            rows = cursor.fetchall()
+        rows = self._query_all(
+            "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+            (session_id,),
+        )
         result = []
         for row in rows:
             msg = dict(row)
@@ -2538,25 +2728,25 @@ class SessionDB:
 
         Cleans up ``{session_id}.json``, ``{session_id}.jsonl``, and any
         ``request_dump_{session_id}_*.json`` files left by the gateway.
-        Silently skips files that don't exist and swallows OSError so a
+        Uses FileStorage so cleanup works across local disk and S3/MinIO.
+        Silently skips files that don't exist and swallows errors so a
         filesystem hiccup never blocks a DB operation.
         """
         if sessions_dir is None:
             return
+        storage = get_storage()
         for suffix in (".json", ".jsonl"):
-            p = sessions_dir / f"{session_id}{suffix}"
             try:
-                p.unlink(missing_ok=True)
-            except OSError:
+                storage.delete(f"sessions/{session_id}{suffix}")
+            except Exception:
                 pass
-        # request_dump files use session_id as a prefix component
         try:
-            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
+            for path in storage.list(f"sessions/request_dump_{session_id}_"):
                 try:
-                    p.unlink(missing_ok=True)
-                except OSError:
+                    storage.delete(path)
+                except Exception:
                     pass
-        except OSError:
+        except Exception:
             pass
 
     def delete_session(
@@ -2573,10 +2763,11 @@ class SessionDB:
         session. Returns True if the session was found and deleted.
         """
         def _do(conn):
-            cursor = conn.execute(
-                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+            # Check existence — use _query_one for shared-DB compat
+            row = self._query_one(
+                "SELECT COUNT(*) as cnt FROM sessions WHERE id = ?", (session_id,)
             )
-            if cursor.fetchone()[0] == 0:
+            if row is None or row.get("cnt", row.get("COUNT(*)", 0)) == 0:
                 return False
             # Orphan child sessions so FK constraint is satisfied
             conn.execute(

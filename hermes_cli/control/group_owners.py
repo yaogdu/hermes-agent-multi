@@ -14,10 +14,9 @@ This module is read by the Control Panel and written by:
 from __future__ import annotations
 
 import os
-import sqlite3
-from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
+
+from .database import Database
 
 
 def _now() -> str:
@@ -25,26 +24,23 @@ def _now() -> str:
 
 
 def get_group_owner(
-    db_path: Path,
+    db: Database,
     platform: str,
     chat_id: str,
 ) -> dict | None:
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            select id, platform, chat_id, owner_external_id, owner_user_id_alt,
-                   established_at, established_session_id, notes
-            from group_owners
-            where platform = ? and chat_id = ?
-            """,
-            (platform.strip().lower(), chat_id.strip()),
-        ).fetchone()
-    return dict(row) if row else None
+    return db.fetchone(
+        """
+        select id, platform, chat_id, owner_external_id, owner_user_id_alt,
+               established_at, established_session_id, notes
+        from group_owners
+        where platform = ? and chat_id = ?
+        """,
+        (platform.strip().lower(), chat_id.strip()),
+    )
 
 
 def claim_group_owner(
-    db_path: Path,
+    db: Database,
     *,
     platform: str,
     chat_id: str,
@@ -64,42 +60,39 @@ def claim_group_owner(
         raise ValueError("platform, chat_id, owner_external_id required")
     identity_id = f"grp_{os.urandom(8).hex()}"
     now = _now()
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        with conn:
-            cur = conn.execute(
-                """
-                insert or ignore into group_owners
-                  (id, platform, chat_id, owner_external_id, owner_user_id_alt,
-                   established_at, established_session_id, notes)
-                values (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    identity_id,
-                    platform,
-                    chat_id,
-                    owner_external_id,
-                    owner_user_id_alt,
-                    now,
-                    session_id,
-                    notes,
-                ),
-            )
-            created = cur.rowcount > 0
-        row = conn.execute(
-            """
-            select id, platform, chat_id, owner_external_id, owner_user_id_alt,
-                   established_at, established_session_id, notes
-            from group_owners
-            where platform = ? and chat_id = ?
-            """,
-            (platform, chat_id),
-        ).fetchone()
-    return dict(row), created
+    cur = db.execute(
+        """
+        insert or ignore into group_owners
+          (id, platform, chat_id, owner_external_id, owner_user_id_alt,
+           established_at, established_session_id, notes)
+        values (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            identity_id,
+            platform,
+            chat_id,
+            owner_external_id,
+            owner_user_id_alt,
+            now,
+            session_id,
+            notes,
+        ),
+    )
+    created = cur.rowcount > 0
+    row = db.fetchone(
+        """
+        select id, platform, chat_id, owner_external_id, owner_user_id_alt,
+               established_at, established_session_id, notes
+        from group_owners
+        where platform = ? and chat_id = ?
+        """,
+        (platform, chat_id),
+    )
+    return row, created
 
 
 def list_group_owners(
-    db_path: Path,
+    db: Database,
     *,
     platform: str | None = None,
     limit: int = 200,
@@ -118,14 +111,11 @@ def list_group_owners(
         sql += " where " + " and ".join(where)
     sql += " order by established_at desc limit ?"
     params.append(str(max(1, min(int(limit), 1000))))
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(sql, tuple(params)).fetchall()
-    return [dict(r) for r in rows]
+    return db.fetchall(sql, tuple(params))
 
 
 def reassign_group_owner(
-    db_path: Path,
+    db: Database,
     group_id: str,
     *,
     new_external_id: str,
@@ -135,27 +125,24 @@ def reassign_group_owner(
     new_external_id = (new_external_id or "").strip()
     if not group_id or not new_external_id:
         raise ValueError("group_id and new_external_id required")
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        with conn:
-            cur = conn.execute(
-                """
-                update group_owners
-                set owner_external_id = ?,
-                    owner_user_id_alt = ?,
-                    notes = coalesce(?, notes)
-                where id = ?
-                """,
-                (new_external_id, new_external_id_alt, notes, group_id),
-            )
-        if cur.rowcount == 0:
-            raise ValueError(f"group_owner not found: {group_id}")
-        row = conn.execute(
-            """
-            select id, platform, chat_id, owner_external_id, owner_user_id_alt,
-                   established_at, established_session_id, notes
-            from group_owners where id = ?
-            """,
-            (group_id,),
-        ).fetchone()
-    return dict(row)
+    cur = db.execute(
+        """
+        update group_owners
+        set owner_external_id = ?,
+            owner_user_id_alt = ?,
+            notes = coalesce(?, notes)
+        where id = ?
+        """,
+        (new_external_id, new_external_id_alt, notes, group_id),
+    )
+    if cur.rowcount == 0:
+        raise ValueError(f"group_owner not found: {group_id}")
+    row = db.fetchone(
+        """
+        select id, platform, chat_id, owner_external_id, owner_user_id_alt,
+               established_at, established_session_id, notes
+        from group_owners where id = ?
+        """,
+        (group_id,),
+    )
+    return row

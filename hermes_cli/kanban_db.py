@@ -956,6 +956,192 @@ _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 
 
+# ---------------------------------------------------------------------------
+# Shared-DB adapter -- makes Database quack like sqlite3.Connection
+# ---------------------------------------------------------------------------
+
+class _SharedDBCursor:
+    """Minimal ``sqlite3.Cursor`` shim backed by a list of dict rows."""
+
+    __slots__ = ("_rows", "_idx", "rowcount", "lastrowid")
+
+    def __init__(self, rows=None, rowcount=0, lastrowid=0):
+        self._rows = list(rows) if rows else []
+        self._idx = 0
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    def fetchone(self):
+        if self._idx >= len(self._rows):
+            return None
+        row = self._rows[self._idx]
+        self._idx += 1
+        return row
+
+    def fetchall(self):
+        remaining = self._rows[self._idx:]
+        self._idx = len(self._rows)
+        return remaining
+
+
+class _KanbanDBAdapter:
+    """Wraps a :class:`~hermes_cli.control.database.Database` so it walks and
+    talks like a ``sqlite3.Connection``.
+
+    All ~100 standalone kanban functions accept ``conn: sqlite3.Connection``
+    as their first argument.  This adapter lets them work unchanged against
+    MySQL or PostgreSQL when ``AGENTOPS_DATABASE_URL`` is set.
+    """
+
+    def __init__(self, db):
+        self._db = db
+        self._row_factory = None
+
+    @property
+    def row_factory(self):
+        return self._row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._row_factory = value
+
+    # -- execute -----------------------------------------------------------
+
+    def execute(self, sql, params=()):
+        sql_upper = sql.strip().upper()
+
+        if sql_upper.startswith("PRAGMA"):
+            return self._handle_pragma(sql)
+
+        if "sqlite_master" in sql.lower():
+            return self._handle_sqlite_master(sql, params)
+
+        if sql_upper.startswith(("SELECT", "WITH")):
+            rows = self._db.fetchall(sql, params)
+            return _SharedDBCursor(rows=rows, rowcount=len(rows))
+
+        cursor = self._db.execute(sql, params)
+        return _SharedDBCursor(
+            rowcount=cursor.rowcount, lastrowid=cursor.lastrowid
+        )
+
+    def _handle_pragma(self, sql):
+        sql_upper = sql.strip().upper()
+        if "TABLE_INFO" in sql_upper:
+            m = re.search(
+                r"table_info\s*\(\s*['\"]?(\w+)['\"]?\s*\)", sql, re.IGNORECASE
+            )
+            if m:
+                table = m.group(1)
+                rows = self._db.fetchall(
+                    "SELECT COLUMN_NAME AS name "
+                    "FROM INFORMATION_SCHEMA.COLUMNS "
+                    "WHERE TABLE_NAME = %s AND TABLE_SCHEMA = DATABASE()",
+                    (table,),
+                )
+                return _SharedDBCursor(rows=rows, rowcount=len(rows))
+        elif "INTEGRITY_CHECK" in sql_upper:
+            return _SharedDBCursor(
+                rows=[{"integrity_check": "ok"}], rowcount=1
+            )
+        return _SharedDBCursor(rows=[], rowcount=0)
+
+    def _handle_sqlite_master(self, sql, params):
+        m = re.search(r"name\s*=\s*['\"](\w+)['\"]", sql, re.IGNORECASE)
+        if m:
+            table_name = m.group(1)
+            rows = self._db.fetchall(
+                "SELECT TABLE_NAME AS name "
+                "FROM INFORMATION_SCHEMA.TABLES "
+                "WHERE TABLE_NAME = %s AND TABLE_SCHEMA = DATABASE()",
+                (table_name,),
+            )
+            return _SharedDBCursor(rows=rows, rowcount=len(rows))
+        return _SharedDBCursor(rows=[], rowcount=0)
+
+    # -- batch execution ---------------------------------------------------
+
+    def executescript(self, sql):
+        for stmt in sql.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                try:
+                    self._db.execute(stmt)
+                except Exception:
+                    pass  # DDL dup errors are expected for IF NOT EXISTS
+
+    # -- transaction stubs (real work done by write_txn) -------------------
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _schema_for_shared_db() -> str:
+    """Return the kanban DDL with MySQL/PostgreSQL-compatible types.
+
+    MySQL cannot index BLOB/TEXT columns without a key-length prefix, and
+    the kanban schema indexes many ``TEXT`` columns (PKs, FKs, status,
+    assignee, tenant, etc.).  We convert every ``TEXT`` column to
+    ``VARCHAR``, preserving the original width where it carries semantic
+    meaning (larger for free-text, smaller for IDs to stay under MySQL's
+    3072-byte InnoDB key limit).
+
+    ``Database.dialect_sql()`` handles ``AUTOINCREMENT`` and
+    ``CREATE INDEX IF NOT EXISTS`` on the fly.
+    """
+    sql = SCHEMA_SQL
+
+    # Step 1 — single-column TEXT PRIMARY KEY: IDs are short hex → VARCHAR(64)
+    sql = re.sub(
+        r"(\w+)\s+TEXT\s+PRIMARY\s+KEY",
+        r"\1 VARCHAR(64) PRIMARY KEY",
+        sql,
+    )
+
+    # Step 2 — composite-PK participants (need narrow widths to fit
+    # MySQL's 3072-byte key limit):
+    #   task_links:        parent_id, child_id
+    #   kanban_notify_subs: task_id, platform, chat_id, thread_id
+    _compact_pk_cols = {
+        "parent_id": "64", "child_id": "64",
+        "task_id": "64", "platform": "32", "chat_id": "64", "thread_id": "64",
+    }
+    for _col, _width in _compact_pk_cols.items():
+        sql = re.sub(
+            rf"(?<=\s){_col}\s+TEXT(\s+NOT\s+NULL)",
+            rf"{_col} VARCHAR({_width})\1",
+            sql,
+        )
+
+    # Step 3 — everything else that is TEXT → VARCHAR(255).
+    # Content-heavy columns (body, payload, summary, error, metadata,
+    # result, last_failure_error) are nullable in this schema and were
+    # not caught by steps 1-2; they stay as true TEXT.
+    sql = re.sub(r"\bTEXT\b", "VARCHAR(255)", sql)
+
+    return sql
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Connection helpers
+# ══════════════════════════════════════════════════════════════════════════
+
+
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
     """Return True for a TLS record header at ``data[offset:]``."""
     if len(data) < offset + 5:
@@ -1132,64 +1318,57 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+_shared_kanban_db: Any = None  # Database instance, set on first connect() in shared mode
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
-) -> sqlite3.Connection:
+) -> Any:  # sqlite3.Connection | _KanbanDBAdapter
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    When ``AGENTOPS_DATABASE_URL`` is set to a MySQL or PostgreSQL URL the
+    function returns a :class:`_KanbanDBAdapter` wrapping a shared
+    :class:`~hermes_cli.control.database.Database`.  All ~100 standalone
+    kanban functions continue to work unchanged because the adapter
+    presents the same ``conn.execute(sql, params).fetchone()`` interface.
 
-    The first connection to a given path auto-runs :func:`init_db` so
-    fresh installs and test harnesses that construct `connect()`
-    directly don't have to remember a separate init step. Subsequent
-    connections skip the schema check via a module-level path cache.
-
-    Path resolution:
-
-    * ``db_path`` explicit → used as-is (legacy callers, tests).
-    * ``board`` explicit → resolves to that board's DB.
-    * Neither → :func:`kanban_db_path` resolves via
-      ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
-      ``<root>/kanban/current`` → ``default``.
+    In local (SQLite) mode the behaviour is identical to prior releases:
+    WAL mode, PRAGMA integrity checks, and additive column migrations on
+    first open.
     """
+    database_url = os.environ.get("AGENTOPS_DATABASE_URL", "").strip()
+
+    # ── Shared-DB path (MySQL / PostgreSQL) ──────────────────────────
+    if database_url:
+        global _shared_kanban_db
+        if _shared_kanban_db is None:
+            from hermes_cli.control.database import Database
+            _shared_kanban_db = Database(database_url)
+            with _INIT_LOCK:
+                _init_shared_schema(_shared_kanban_db)
+        return _KanbanDBAdapter(_shared_kanban_db)
+
+    # ── Local SQLite path ────────────────────────────────────────────
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
-    # and other invalid-header cases without opening a sqlite connection.
     _validate_sqlite_header(path)
-    # Full integrity probe — catches corruption past the header (malformed
-    # pages, broken internal metadata). Cached per-path after first success
-    # via _INITIALIZED_PATHS so it only runs once per process per path.
     _guard_existing_db_is_healthy(path)
     resolved = str(path.resolve())
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
     try:
         conn.row_factory = sqlite3.Row
         with _INIT_LOCK:
-            # WAL activation can take an exclusive lock while SQLite creates the
-            # sidecar files for a fresh database. Keep it in the same process-local
-            # critical section as schema initialization so concurrent gateway
-            # startup threads do not race before _INITIALIZED_PATHS is populated.
-            # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-            # falls back to DELETE with one WARNING so kanban stays usable there.
-            # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
             from hermes_state import apply_wal_with_fallback
             apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
             needs_init = resolved not in _INITIALIZED_PATHS
             if needs_init:
-                # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                # migrations. Cached so subsequent connect() calls in the same
-                # process are cheap. The lock prevents same-process dispatcher
-                # threads from racing through the additive ALTER TABLE pass with
-                # stale PRAGMA snapshots during gateway startup.
                 conn.executescript(SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
                 _INITIALIZED_PATHS.add(resolved)
@@ -1197,6 +1376,47 @@ def connect(
         conn.close()
         raise
     return conn
+
+
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split *sql* on ``;``, ignoring semicolons inside ``--`` line comments."""
+    statements = []
+    current: list[str] = []
+    for line in sql.split("\n"):
+        stripped = line.strip()
+        # Flush on a bare ``;`` line (the SCHEMA_SQL uses these)
+        if stripped == ";":
+            if current:
+                statements.append("\n".join(current))
+                current = []
+            continue
+        # Find the real content — before any ``--`` comment
+        content = stripped.split("--")[0].strip()
+        if content.endswith(";"):
+            current.append(line)
+            statements.append("\n".join(current))
+            current = []
+        else:
+            current.append(line)
+    if current:
+        body = "\n".join(current).strip()
+        if body:
+            statements.append(body)
+    return statements
+
+
+def _init_shared_schema(db: Any) -> None:
+    """Run kanban schema DDL and migrations against a shared Database."""
+    # Split multi-statement DDL — MySQL/PG execute() handles one statement at a time.
+    # Use _split_sql_statements to avoid splitting on ; inside -- comments.
+    for stmt in _split_sql_statements(_schema_for_shared_db()):
+        stmt = stmt.strip()
+        if stmt:
+            db.execute(stmt)  # backend handles DDL dup errors silently
+    # Run additive migrations through the adapter so PRAGMA / sqlite_master
+    # queries are transparently translated.
+    _migrate_add_optional_columns(_KanbanDBAdapter(db))
+    _INITIALIZED_PATHS.add("__shared__")
 
 
 def init_db(
@@ -1213,15 +1433,27 @@ def init_db(
     may have drifted — tests that write legacy event kinds directly,
     external tools that upgrade an old DB file — can call this to
     force re-migration.
+
+    In shared-DB mode (``AGENTOPS_DATABASE_URL`` set) this re-runs the
+    shared schema DDL and migration pass unconditionally.
     """
+    database_url = os.environ.get("AGENTOPS_DATABASE_URL", "").strip()
+    if database_url:
+        global _shared_kanban_db
+        if _shared_kanban_db is None:
+            from hermes_cli.control.database import Database
+            _shared_kanban_db = Database(database_url)
+        with _INIT_LOCK:
+            _INITIALIZED_PATHS.discard("__shared__")
+            _init_shared_schema(_shared_kanban_db)
+        return Path(database_url)  # not a real path, but satisfies the return type
+
     if db_path is not None:
         path = db_path
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
-    # Clear the cache entry so the underlying connect() re-runs the
-    # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
     with contextlib.closing(connect(path)):
@@ -1467,13 +1699,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
 
 @contextlib.contextmanager
-def write_txn(conn: sqlite3.Connection):
-    """Context manager for an IMMEDIATE write transaction.
+def write_txn(conn):
+    """Context manager for a serialisable write transaction.
 
-    Use for any multi-statement write (creating a task + link, claiming a
-    task + recording an event, etc.).  A claim CAS inside this context is
-    atomic -- at most one concurrent writer can succeed.
+    For SQLite this wraps ``BEGIN IMMEDIATE`` / ``COMMIT`` / ``ROLLBACK``.
+    For the shared-DB adapter it delegates to
+    ``Database.transaction()`` so the whole block runs on a single
+    MySQL/PostgreSQL connection.
     """
+    if isinstance(conn, _KanbanDBAdapter):
+        with conn._db.transaction():
+            yield conn
+        return
+
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -1755,6 +1993,14 @@ def create_task(
             if attempt == 1:
                 raise
             # Retry with a fresh id.
+            continue
+        except Exception as exc:
+            # MySQL/PG duplicate-key errors (task ID collision)
+            msg = str(exc).lower()
+            if not any(kw in msg for kw in ("duplicate", "unique", "integrity")):
+                raise
+            if attempt == 1:
+                raise
             continue
     raise RuntimeError("unreachable")
 

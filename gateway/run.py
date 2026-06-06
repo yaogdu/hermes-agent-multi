@@ -9617,14 +9617,15 @@ class GatewayRunner:
         )
 
     async def _handle_bind_command(self, event: MessageEvent) -> str:
-        """Handle /bind <username> <password> — self-service identity binding.
+        """Handle /bind [code] — self-service identity binding.
 
         Links the caller's platform identity (e.g. Feishu open_id) to a
-        Control Panel user account so they can see their own sessions, costs,
-        and memories in the Control Panel web UI.
+        Control Panel user account.
 
-        Safe to run mid-turn — only reads/writes the Control Panel SQLite db,
-        never touches agent state.
+        Two modes:
+        - ``/bind`` (no args) — show current binding status + instructions
+        - ``/bind <code>`` — verify a one-time code generated in the Control
+          Panel web UI and create the user_identities row
         """
         source = event.source
         args = event.get_command_args().strip()
@@ -9638,151 +9639,96 @@ class GatewayRunner:
         user_id_alt = (source.user_id_alt if source else None) or ""
         user_name = (source.user_name if source else None) or ""
 
-        if not args:
-            if not platform or not user_id:
-                return (
-                    "**/bind** — 绑定平台身份到 Control Panel 账号\n\n"
-                    "用法: `/bind <username> <password>`\n\n"
-                    "无法确定你的平台身份。请在 DM 中使用此命令。"
-                )
-            return (
-                f"**/bind** — 绑定平台身份到 Control Panel 账号\n\n"
-                f"用法: `/bind <username> <password>`\n\n"
-                f"你的平台身份:\n"
-                f"  平台: {platform}\n"
-                f"  ID: `{user_id}`\n\n"
-                f"管理员创建你的 Control Panel 账号后，\n"
-                f"在这里绑定即可在网页端看到自己的会话记录。"
-            )
-
-        parts = args.split(None, 1)
-        username = parts[0].strip()
-        password = parts[1].strip() if len(parts) > 1 else ""
-
-        if not username or not password:
-            return "用法: `/bind <username> <password>`"
-
         if not platform or not user_id:
             return (
-                "无法确定你的平台身份。\n"
-                "请在 DM 中使用 `/bind` 命令（群聊中不支持绑定）。"
+                "**/bind** — 绑定平台身份到 Control Panel 账号\n\n"
+                "无法确定你的平台身份。请在 DM 中使用此命令。"
             )
 
-        # Resolve the Control Panel db path
-        db_path = os.environ.get("AGENTOPS_CONTROL_DB_PATH", "").strip()
-        if not db_path:
-            logger.warning("Bind command: AGENTOPS_CONTROL_DB_PATH not set")
+        # ── Resolve control database ──────────────────────────────────────
+        database_url = os.environ.get("AGENTOPS_DATABASE_URL", "")
+        if not database_url:
+            db_path = os.environ.get("AGENTOPS_CONTROL_DB_PATH", "").strip()
+            if db_path:
+                database_url = f"sqlite:///{db_path}"
+        if not database_url:
+            logger.warning("Bind command: no database URL configured")
             return "Control Panel 数据库未配置。请联系管理员。"
 
         try:
-            import bcrypt as _bcrypt_mod
+            from hermes_cli.control.database import Database
+            from hermes_cli.control.bind import (
+                get_binding_status,
+                verify_and_bind,
+            )
         except ImportError:
-            logger.warning("Bind command: bcrypt not installed")
-            return "密码验证模块未安装。请联系管理员。"
+            logger.warning("Bind command: control modules not available")
+            return "绑定模块加载失败。请联系管理员。"
+
+        db = Database(database_url)
 
         try:
-            with sqlite3.connect(db_path, timeout=2.0) as conn:
-                conn.row_factory = sqlite3.Row
-
-                row = conn.execute(
-                    "SELECT id, username, password_hash, role, status FROM users WHERE username = ?",
-                    (username,),
-                ).fetchone()
-
-                if not row:
-                    logger.info(
-                        "Bind command: username %r not found for platform=%s user_id=%s",
-                        username, platform, user_id,
+            # ── No args: show status ──────────────────────────────────────
+            if not args:
+                status = get_binding_status(db, platform, user_id)
+                if status:
+                    return (
+                        f"你的身份已绑定到 Control Panel 用户:\n\n"
+                        f"  用户名: **{status['username']}**\n"
+                        f"  显示名: {status.get('user_display_name', '')}\n"
+                        f"  平台: {platform}\n"
+                        f"  ID: `{user_id}`\n\n"
+                        f"如需更换绑定，请联系管理员。"
                     )
-                    return f"用户 `{username}` 不存在。请检查用户名或联系管理员。"
-
-                if row["status"] != "active":
-                    return f"用户 `{username}` 已被禁用。请联系管理员。"
-
-                # Verify password
-                password_hash = row["password_hash"]
-                try:
-                    if not _bcrypt_mod.checkpw(
-                        password.encode("utf-8"), password_hash.encode("utf-8")
-                    ):
-                        logger.info(
-                            "Bind command: wrong password for user=%s platform=%s user_id=%s",
-                            username, platform, user_id,
-                        )
-                        return "密码错误。请重试。"
-                except Exception as _exc:
-                    logger.warning(
-                        "Bind command: bcrypt verify failed for user=%s: %s",
-                        username, _exc,
-                    )
-                    return "密码验证失败。请联系管理员。"
-
-                # Check existing binding
-                existing = conn.execute(
-                    "SELECT id, user_id FROM user_identities WHERE platform = ? AND external_id = ?",
-                    (platform, user_id),
-                ).fetchone()
-
-                if existing:
-                    if existing["user_id"] == row["id"]:
-                        return (
-                            f"你的身份已经绑定到 `{username}` 了。\n"
-                            f"平台: {platform}\n"
-                            f"ID: `{user_id}`"
-                        )
-                    else:
-                        return (
-                            f"该平台身份已绑定到其他用户。\n"
-                            f"如需更换绑定，请联系管理员。\n"
-                            f"平台: {platform}\n"
-                            f"ID: `{user_id}`"
-                        )
-
-                # Create the identity binding
-                identity_id = f"idt_{os.urandom(8).hex()}"
-                from datetime import timezone
-                now = datetime.now(timezone.utc).isoformat()
-                conn.execute(
-                    """INSERT INTO user_identities
-                       (id, user_id, platform, external_id, external_id_alt, display_name, bound_at, bound_by)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        identity_id,
-                        row["id"],
-                        platform,
-                        user_id,
-                        user_id_alt,
-                        user_name,
-                        now,
-                        "self-service /bind",
-                    ),
-                )
-                conn.commit()
-
-                logger.info(
-                    "Bind command: user=%s bound platform=%s external_id=%s",
-                    username, platform, user_id,
-                )
-
-                admin_hint = ""
-                if row["role"] == "admin":
-                    admin_hint = "\n你拥有管理员权限，可以在 Control Panel 管理其他用户。"
-
                 return (
-                    f"绑定成功！\n"
-                    f"Control Panel 用户: `{username}`\n"
-                    f"平台: {platform}\n"
-                    f"ID: `{user_id}`\n"
-                    f"角色: {row['role']}"
-                    f"{admin_hint}"
+                    "**/bind** — 绑定平台身份到 Control Panel 账号\n\n"
+                    f"你的平台身份:\n"
+                    f"  平台: {platform}\n"
+                    f"  ID: `{user_id}`\n\n"
+                    "**自助绑定步骤:**\n"
+                    "1. 登录 Control Panel 网页端\n"
+                    "2. 进入个人页面，点击「生成绑定码」\n"
+                    "3. 复制 6 位绑定码\n"
+                    "4. 在这里输入 `/bind <绑定码>`\n\n"
+                    "绑定后即可在网页端查看自己的会话记录。"
                 )
 
-        except sqlite3.OperationalError as e:
-            logger.warning("Bind command: db access failed: %s", e)
-            return "无法访问 Control Panel 数据库。请稍后重试或联系管理员。"
+            # ── Code-based binding ─────────────────────────────────────────
+            code = args.strip().upper()
+            try:
+                result = verify_and_bind(
+                    db,
+                    code=code,
+                    platform=platform,
+                    external_id=user_id,
+                    external_id_alt=user_id_alt,
+                    display_name=user_name,
+                )
+            except ValueError as e:
+                return str(e)
+
+            if result is None:
+                return (
+                    "绑定码无效或已过期。\n\n"
+                    "请在 Control Panel 网页端重新生成绑定码。\n"
+                    "绑定码有效期为 10 分钟。"
+                )
+
+            username = result.get("username", "unknown")
+            user_display = result.get("user_display_name", "")
+            return (
+                "绑定成功！\n\n"
+                f"Control Panel 用户: **{username}**\n"
+                f"{'显示名: ' + user_display if user_display else ''}\n"
+                f"平台: {platform}\n"
+                f"ID: `{user_id}`"
+            )
+
         except Exception as e:
-            logger.warning("Bind command: unexpected error: %s", e, exc_info=True)
-            return f"绑定失败: {e}\n请联系管理员处理。"
+            logger.warning("Bind command: error: %s", e, exc_info=True)
+            return "绑定失败。请稍后重试或联系管理员。"
+        finally:
+            db.close()
 
 
     async def _handle_ask_command(self, event: MessageEvent) -> Optional[str]:

@@ -14,13 +14,21 @@ import hashlib
 import logging
 import os
 import secrets
-import sqlite3
-from contextlib import closing
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Iterable
 
+from .database import Database
+
 logger = logging.getLogger(__name__)
+
+
+def _redis() -> "Redis | None":  # type: ignore[name-defined]  # noqa: F821
+    """Lazy import to avoid circular dependency."""
+    try:
+        from .redis_cache import get_redis
+        return get_redis()
+    except ImportError:
+        return None
 
 
 # ── Password hashing ────────────────────────────────────────────────────────
@@ -67,7 +75,7 @@ def _hash_token(token: str) -> str:
 
 
 def authenticate_user(
-    db_path: Path,
+    db: Database,
     username: str,
     password: str,
     *,
@@ -78,170 +86,184 @@ def authenticate_user(
     if not username or not password:
         return None
     hasher = hasher or PasswordHasher()
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            select id, username, password_hash, display_name, role, status,
-                   created_at, updated_at, last_login_at, password_changed_at
-            from users
-            where lower(username) = ? and status = 'active' and role != 'system'
-            """,
-            (username,),
-        ).fetchone()
+    row = db.fetchone(
+        """
+        select id, username, password_hash, display_name, role, status,
+               created_at, updated_at, last_login_at, password_changed_at
+        from users
+        where lower(username) = ? and status = 'active' and role != 'system'
+        """,
+        (username,),
+    )
     if not row:
         return None
-    user = dict(row)
-    if not hasher.verify(password, user["password_hash"]):
+    if not hasher.verify(password, row["password_hash"]):
         return None
-    user.pop("password_hash", None)
-    return user
+    row.pop("password_hash", None)
+    return row
 
 
-def touch_last_login(db_path: Path, user_id: str) -> None:
+def touch_last_login(db: Database, user_id: str) -> None:
     now = _now_iso()
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        with conn:
-            conn.execute(
-                "update users set last_login_at = ?, updated_at = ? where id = ?",
-                (now, now, user_id),
-            )
+    db.execute(
+        "update users set last_login_at = ?, updated_at = ? where id = ?",
+        (now, now, user_id),
+    )
 
 
-def get_user(db_path: Path, user_id: str) -> dict | None:
+def get_user(db: Database, user_id: str) -> dict | None:
     if not user_id:
         return None
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            select id, username, display_name, role, status,
-                   created_at, updated_at, last_login_at, password_changed_at
-            from users where id = ?
-            """,
-            (user_id,),
-        ).fetchone()
-    return dict(row) if row else None
+    return db.fetchone(
+        """
+        select id, username, display_name, role, status,
+               created_at, updated_at, last_login_at, password_changed_at
+        from users where id = ?
+        """,
+        (user_id,),
+    )
 
 
-def get_user_by_username(db_path: Path, username: str) -> dict | None:
+def get_user_by_username(db: Database, username: str) -> dict | None:
     username = (username or "").strip().lower()
     if not username:
         return None
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            select id, username, display_name, role, status,
-                   created_at, updated_at, last_login_at, password_changed_at
-            from users where lower(username) = ?
-            """,
-            (username,),
-        ).fetchone()
-    return dict(row) if row else None
+    return db.fetchone(
+        """
+        select id, username, display_name, role, status,
+               created_at, updated_at, last_login_at, password_changed_at
+        from users where lower(username) = ?
+        """,
+        (username,),
+    )
 
 
 # ── Session → user resolution ────────────────────────────────────────────────
 
 
-def resolve_session_to_user(db_path: Path, token: str) -> dict | None:
+def resolve_session_to_user(db: Database, token: str) -> dict | None:
     """Look up the active control_session by token, JOIN users on actor=username.
 
     Returns {session: {id, actor, ...}, user: {id, username, role, ...}} or None.
+    Checks Redis cache first; falls back to database query on cache miss.
     """
     token = (token or "").strip()
     if not token:
         return None
+    token_hash = _hash_token(token)
+
+    # 1. Try Redis cache.
+    r = _redis()
+    if r and r.available:
+        cached = r.get_session(token_hash)
+        if cached:
+            return cached
+
+    # 2. Database query.
     now = _now_iso()
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            """
-            select
-              s.id           as session_id,
-              s.actor        as session_actor,
-              s.created_at   as session_created_at,
-              s.expires_at   as session_expires_at,
-              u.id           as user_id,
-              u.username     as username,
-              u.display_name as display_name,
-              u.role         as role,
-              u.status       as status
-            from control_sessions s
-            join users u on lower(u.username) = lower(s.actor)
-            where s.token_hash = ? and s.revoked_at is null
-              and s.expires_at > ? and u.status = 'active'
-            """,
-            (_hash_token(token), now),
-        ).fetchone()
+    row = db.fetchone(
+        """
+        select
+          s.id           as session_id,
+          s.actor        as session_actor,
+          s.created_at   as session_created_at,
+          s.expires_at   as session_expires_at,
+          u.id           as user_id,
+          u.username     as username,
+          u.display_name as display_name,
+          u.role         as role,
+          u.status       as status
+        from control_sessions s
+        join users u on lower(u.username) = lower(s.actor)
+        where s.token_hash = ? and s.revoked_at is null
+          and s.expires_at > ? and u.status = 'active'
+        """,
+        (token_hash, now),
+    )
     if not row:
         return None
-    r = dict(row)
-    return {
+
+    result = {
         "session": {
-            "id": r["session_id"],
-            "actor": r["session_actor"],
-            "created_at": r["session_created_at"],
-            "expires_at": r["session_expires_at"],
+            "id": row["session_id"],
+            "actor": row["session_actor"],
+            "created_at": row["session_created_at"],
+            "expires_at": row["session_expires_at"],
         },
         "user": {
-            "id": r["user_id"],
-            "username": r["username"],
-            "display_name": r["display_name"],
-            "role": r["role"],
-            "status": r["status"],
+            "id": row["user_id"],
+            "username": row["username"],
+            "display_name": row["display_name"],
+            "role": row["role"],
+            "status": row["status"],
         },
     }
+
+    # 3. Cache for subsequent lookups.
+    if r and r.available:
+        try:
+            expire_dt = datetime.fromisoformat(row["session_expires_at"])
+            ttl = max(1, int((expire_dt - datetime.now(timezone.utc)).total_seconds()))
+        except (ValueError, TypeError):
+            ttl = 28800
+        r.set_session(token_hash, result, ttl)
+
+    return result
 
 
 # ── Control session management ───────────────────────────────────────────────
 
 
 def create_control_session(
-    db_path: Path,
+    db: Database,
     actor: str,
     *,
     source_ip: str | None = None,
     user_agent: str | None = None,
     ttl_seconds: int = 28800,
 ) -> dict:
-    """Create a control session row and return {token, session_id, expires_at}."""
+    """Create a control session row and return {token, session_id, expires_at}.
+
+    Also caches the session in Redis if configured.
+    """
     token = secrets.token_urlsafe(48)
     session_id = f"ses_{os.urandom(8).hex()}"
     now = _now_iso()
     from datetime import timedelta
     expires = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
-    try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
-            with conn:
-                conn.execute(
-                    """
-                    insert into control_sessions
-                      (id, actor, token_hash, source_ip, user_agent, created_at, expires_at)
-                    values (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (session_id, actor.strip(), _hash_token(token), source_ip, user_agent, now, expires),
-                )
-    except sqlite3.OperationalError:
-        # control_sessions table might not exist yet
-        raise
+    token_hash = _hash_token(token)
+    db.execute(
+        """
+        insert into control_sessions
+          (id, actor, token_hash, source_ip, user_agent, created_at, expires_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (session_id, actor.strip(), token_hash, source_ip, user_agent, now, expires),
+    )
     return {"token": token, "session_id": session_id, "expires_at": expires}
 
 
-def revoke_control_session(db_path: Path, token: str) -> bool:
-    """Revoke a control session by token. Returns True if a row was revoked."""
+def revoke_control_session(db: Database, token: str) -> bool:
+    """Revoke a control session by token. Returns True if a row was revoked.
+
+    Also removes the session from Redis cache if configured.
+    """
     now = _now_iso()
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        with conn:
-            cur = conn.execute(
-                "update control_sessions set revoked_at = ? where token_hash = ? and revoked_at is null",
-                (now, _hash_token(token)),
-            )
-    return cur.rowcount > 0
+    token_hash = _hash_token(token)
+    cur = db.execute(
+        "update control_sessions set revoked_at = ? where token_hash = ? and revoked_at is null",
+        (now, token_hash),
+    )
+    revoked = cur.rowcount > 0
+    if revoked:
+        r = _redis()
+        if r and r.available:
+            r.delete_session(token_hash)
+    return revoked
 
 
 def change_password(
-    db_path: Path,
+    db: Database,
     user_id: str,
     current_password: str,
     new_password: str,
@@ -256,31 +278,26 @@ def change_password(
         return "new password must be at least 8 characters"
     hasher = hasher or PasswordHasher()
     now = _now_iso()
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "select id, password_hash, status from users where id = ? and status = 'active'",
-            (user_id,),
-        ).fetchone()
+    row = db.fetchone(
+        "select id, password_hash, status from users where id = ? and status = 'active'",
+        (user_id,),
+    )
     if not row:
         return "user not found or disabled"
-    user = dict(row)
-    if not hasher.verify(current_password, user["password_hash"]):
+    if not hasher.verify(current_password, row["password_hash"]):
         return "current password is incorrect"
     new_hash = hasher.hash(new_password)
-    with closing(sqlite3.connect(str(db_path))) as conn:
-        with conn:
-            conn.execute(
-                "update users set password_hash = ?, password_changed_at = ?, updated_at = ? where id = ?",
-                (new_hash, now, now, user_id),
-            )
+    db.execute(
+        "update users set password_hash = ?, password_changed_at = ?, updated_at = ? where id = ?",
+        (new_hash, now, now, user_id),
+    )
     return ""
 
 
 # ── Scope computation ────────────────────────────────────────────────────────
 
 
-def scope_for_user(db_path: Path, user: dict) -> dict:
+def scope_for_user(db: Database, user: dict) -> dict:
     """Compute the data scope for a user.
 
     Returns {all: bool, hermes_user_ids: list[str]}.
@@ -297,21 +314,20 @@ def scope_for_user(db_path: Path, user: dict) -> dict:
 
     ids: list[str] = []
     try:
-        with closing(sqlite3.connect(str(db_path))) as conn:
-            rows = conn.execute(
-                """
-                select external_id, external_id_alt
-                from user_identities
-                where user_id = ?
-                """,
-                (user_id,),
-            ).fetchall()
+        rows = db.fetchall(
+            """
+            select external_id, external_id_alt
+            from user_identities
+            where user_id = ?
+            """,
+            (user_id,),
+        )
         for r in rows:
-            if r[0]:
-                ids.append(r[0])
-            if r[1]:
-                ids.append(r[1])
-    except sqlite3.OperationalError:
+            if r["external_id"]:
+                ids.append(r["external_id"])
+            if r["external_id_alt"]:
+                ids.append(r["external_id_alt"])
+    except Exception:
         pass
 
     return {"all": False, "hermes_user_ids": list(set(ids))}

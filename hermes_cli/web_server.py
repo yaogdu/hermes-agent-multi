@@ -154,11 +154,11 @@ def _has_valid_session_token(request: Request) -> bool:
     cp_token = request.headers.get("X-AgentOps-Session", "").strip()
     if cp_token:
         try:
-            from hermes_cli.control.routes import get_control_db_path
-            db_path = get_control_db_path()
-            if db_path:
+            from hermes_cli.control.routes import get_control_db
+            db = get_control_db()
+            if db:
                 from hermes_cli.control.auth import resolve_session_to_user
-                resolved = resolve_session_to_user(db_path, cp_token)
+                resolved = resolve_session_to_user(db, cp_token)
                 if resolved is not None:
                     return True
         except Exception:
@@ -811,18 +811,18 @@ def _get_user_ids_scope(request: Request) -> list[str] | None:
     if not cp_token:
         return None  # dashboard ephemeral token — full access
     try:
-        from hermes_cli.control.routes import get_control_db_path
-        db_path = get_control_db_path()
-        if not db_path:
+        from hermes_cli.control.routes import get_control_db
+        db = get_control_db()
+        if not db:
             return None
         from hermes_cli.control.auth import resolve_session_to_user, is_admin, scope_for_user
-        resolved = resolve_session_to_user(db_path, cp_token)
+        resolved = resolve_session_to_user(db, cp_token)
         if resolved is None:
             return None
         user = resolved["user"]
         if is_admin(user):
             return None
-        scope = scope_for_user(db_path, user)
+        scope = scope_for_user(db, user)
         if scope["all"]:
             return None
         return scope["hermes_user_ids"] if scope["hermes_user_ids"] else []
@@ -4778,7 +4778,7 @@ _mount_plugin_api_routes()
 
 # Mount Control Panel auth + admin API routes.
 try:
-    from hermes_cli.control.routes import router as _control_router, set_control_db_path
+    from hermes_cli.control.routes import router as _control_router, set_control_db
     app.include_router(_control_router)
     _log.info("Mounted Control Panel API routes (/api/auth/*, /api/admin/*)")
 except Exception:
@@ -4787,41 +4787,77 @@ except Exception:
 mount_spa(app)
 
 
+def _setup_redis():
+    """Initialize Redis for Control Panel session caching (optional).
+
+    Reads ``AGENTOPS_REDIS_URL`` env var. Gracefully skips if not set or
+    if Redis is unreachable.
+    """
+    redis_url = os.environ.get("AGENTOPS_REDIS_URL", "").strip()
+    if not redis_url:
+        return
+    try:
+        from hermes_cli.control.redis_cache import setup_redis as _setup_r
+    except ImportError:
+        _log.debug("redis_cache module not available; skipping Redis setup")
+        return
+    r = _setup_r(redis_url)
+    if r and r.available:
+        _log.info("Control Panel Redis cache: %s", _redact_url(redis_url))
+
+
 def _setup_control_panel_db():
     """Initialize the Control Panel database: apply migrations, bootstrap admin.
 
-    The db path comes from ``AGENTOPS_CONTROL_DB_PATH`` env var, defaulting to
+    Reads ``AGENTOPS_DATABASE_URL`` env var for MySQL/PostgreSQL, falls back to
+    ``AGENTOPS_CONTROL_DB_PATH`` for SQLite, defaulting to
     ``~/.hermes/agentops_control.db``.
     """
     try:
         from hermes_cli.control.migrations import apply_migrations, bootstrap_admin
-        from hermes_cli.control.routes import set_control_db_path as _set_db
+        from hermes_cli.control.routes import set_control_db as _set_db
+        from hermes_cli.control.database import Database
     except ImportError:
         _log.debug("Control Panel modules not available; skipping db setup")
         return
 
-    db_path = Path(
-        os.environ.get(
+    database_url = os.environ.get("AGENTOPS_DATABASE_URL", "")
+    if not database_url:
+        db_path = os.environ.get(
             "AGENTOPS_CONTROL_DB_PATH",
             str(get_hermes_home() / "agentops_control.db"),
         )
-    )
-    _log.info("Control Panel db: %s", db_path)
-    _set_db(db_path)
+        database_url = f"sqlite:///{db_path}"
+
+    _log.info("Control Panel database: %s", _redact_url(database_url))
+    db = Database(database_url)
+
+    # Ensure SQLite directory exists
+    if db.backend_name == "sqlite":
+        sqlite_path = database_url.replace("sqlite:///", "")
+        Path(sqlite_path).parent.mkdir(parents=True, exist_ok=True)
+
+    _set_db(db)
 
     try:
-        version = apply_migrations(db_path)
+        version = apply_migrations(db)
         _log.info("Control Panel migrations applied (v%d)", version)
     except Exception:
         _log.exception("Control Panel migrations failed")
         return
 
     try:
-        admin = bootstrap_admin(db_path)
+        admin = bootstrap_admin(db)
         if admin:
             _log.warning("Bootstrap admin created: %s", admin["username"])
     except Exception:
         _log.exception("Control Panel bootstrap_admin failed")
+
+
+def _redact_url(url: str) -> str:
+    """Hide password in database URL for logging."""
+    import re
+    return re.sub(r"://([^:]+):[^@]+@", r"://\1:***@", url)
 
 
 def start_server(
@@ -4859,6 +4895,7 @@ def start_server(
     app.state.bound_port = port
 
     # ── Control Panel database setup ───────────────────────────────────────
+    _setup_redis()
     _setup_control_panel_db()
 
     if open_browser:

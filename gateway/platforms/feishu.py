@@ -204,6 +204,8 @@ _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
 # ---------------------------------------------------------------------------
 
 _FEISHU_DEDUP_TTL_SECONDS = 24 * 60 * 60          # 24 hours — matches openclaw
+_REDIS_DEDUP_KEY_PREFIX = "hermes:feishu:seen:"
+_dedup_redis_client: Any = None  # Redis wrapper, set once at module load
 _FEISHU_SENDER_NAME_TTL_SECONDS = 10 * 60          # 10 minutes sender-name cache
 _FEISHU_WEBHOOK_MAX_BODY_BYTES = 1 * 1024 * 1024   # 1 MB body limit
 _FEISHU_WEBHOOK_RATE_WINDOW_SECONDS = 60            # sliding window for rate limiter
@@ -213,6 +215,32 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+
+
+def _setup_dedup_redis() -> Any:
+    """Set up Redis-backed dedup for multi-node deployments.
+
+    When ``AGENTOPS_REDIS_URL`` is set, returns a Redis wrapper that can
+    check/record seen message IDs across gateway nodes.  Returns ``None``
+    (keeping the local-JSON dedup path) when Redis is not configured.
+    """
+    global _dedup_redis_client
+    redis_url = os.environ.get("AGENTOPS_REDIS_URL", "").strip()
+    if not redis_url:
+        return None
+    if _dedup_redis_client is not None:
+        return _dedup_redis_client
+    try:
+        from hermes_cli.control.redis_cache import Redis as _RedisWrapper
+    except ImportError:
+        logger.debug("[Feishu] redis_cache module not available; skipping Redis dedup")
+        return None
+    _dedup_redis_client = _RedisWrapper(redis_url)
+    if _dedup_redis_client.available:
+        logger.info("[Feishu] Redis dedup enabled: %s", redis_url.split("@")[-1] if "@" in redis_url else redis_url)
+        return _dedup_redis_client
+    _dedup_redis_client = None
+    return None
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
@@ -1434,6 +1462,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
+        self._dedup_redis = _setup_dedup_redis()  # None if Redis not configured
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
@@ -4844,19 +4873,49 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Failed to persist dedup state to %s", self._dedup_state_path, exc_info=True)
 
     def _is_duplicate(self, message_id: str) -> bool:
+        # ── Redis path (multi-node dedup) ──────────────────────────
+        if self._dedup_redis is not None:
+            return self._is_duplicate_redis(message_id)
+
+        # ── Local path (single-node, legacy) ──────────────────────
         now = time.time()
         ttl = _FEISHU_DEDUP_TTL_SECONDS
         with self._dedup_lock:
             seen_at = self._seen_message_ids.get(message_id)
             if seen_at is not None and (ttl <= 0 or now - seen_at < ttl):
                 return True
-            # Record with current wall-clock timestamp so TTL works across restarts.
             self._seen_message_ids[message_id] = now
             self._seen_message_order.append(message_id)
             while len(self._seen_message_order) > self._dedup_cache_size:
                 stale = self._seen_message_order.pop(0)
                 self._seen_message_ids.pop(stale, None)
             self._persist_seen_message_ids()
+            return False
+
+    def _is_duplicate_redis(self, message_id: str) -> bool:
+        """Check/record dedup via Redis SETEX for cross-node visibility."""
+        key = _REDIS_DEDUP_KEY_PREFIX + message_id
+        try:
+            client = self._dedup_redis._client
+            # SET key 1 NX EX ttl → returns True if key was set (new),
+            # None/False if key already existed (duplicate).
+            was_set = client.set(key, "1", nx=True, ex=_FEISHU_DEDUP_TTL_SECONDS)
+            return not was_set
+        except Exception:
+            # Redis unavailable — fall through to local dedup to be safe
+            pass
+        # Graceful fallback: use local memory cache
+        now = time.time()
+        ttl = _FEISHU_DEDUP_TTL_SECONDS
+        with self._dedup_lock:
+            seen_at = self._seen_message_ids.get(message_id)
+            if seen_at is not None and (ttl <= 0 or now - seen_at < ttl):
+                return True
+            self._seen_message_ids[message_id] = now
+            self._seen_message_order.append(message_id)
+            while len(self._seen_message_order) > self._dedup_cache_size:
+                stale = self._seen_message_order.pop(0)
+                self._seen_message_ids.pop(stale, None)
             return False
 
     # =========================================================================

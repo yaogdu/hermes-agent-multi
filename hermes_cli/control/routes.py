@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import os
-from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -30,6 +29,7 @@ from .auth import (
     scope_for_user,
     touch_last_login,
 )
+from .database import Database
 from .group_owners import (
     get_group_owner,
     list_group_owners,
@@ -39,6 +39,7 @@ from .users import (
     add_identity,
     create_user,
     get_identity,
+    get_user,
     list_identities,
     list_users,
     remove_identity,
@@ -50,23 +51,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Set by web_server.start_server — the control panel's own sqlite database.
-_control_db_path: Path | None = None
+# Set by web_server.start_server — the control panel's database handle.
+_db: Database | None = None
 
 
-def set_control_db_path(path: Path) -> None:
-    global _control_db_path
-    _control_db_path = path
+def set_control_db(db: Database) -> None:
+    global _db
+    _db = db
 
 
-def get_control_db_path() -> Path | None:
-    return _control_db_path
+def get_control_db() -> Database | None:
+    return _db
 
 
-def _get_db() -> Path:
-    if _control_db_path is None:
+def _get_db() -> Database:
+    if _db is None:
         raise HTTPException(status_code=500, detail="Control database not configured")
-    return _control_db_path
+    return _db
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -218,6 +219,34 @@ async def change_pwd(
     return {"ok": True}
 
 
+# ── Self-service identity binding ─────────────────────────────────────────────
+
+
+class GenerateBindCodeResponse(BaseModel):
+    code: str
+    expires_in_minutes: int = 10
+
+
+@router.post("/api/auth/generate-bind-code", response_model=GenerateBindCodeResponse)
+async def generate_bind_code(auth: dict = Depends(_require_auth)):
+    """Generate a one-time code that the user can /bind in chat."""
+    from .bind import generate_bind_code as _gen
+
+    db = _get_db()
+    code = _gen(db, auth["user"]["id"])
+    return {"code": code, "expires_in_minutes": 10}
+
+
+@router.get("/api/auth/bind-status")
+async def bind_status(auth: dict = Depends(_require_auth)):
+    """Return the current user's binding status across all platforms."""
+    from .users import list_identities
+
+    db = _get_db()
+    identities = list_identities(db, user_id=auth["user"]["id"])
+    return {"user_id": auth["user"]["id"], "identities": identities}
+
+
 # ── Admin: Users ───────────────────────────────────────────────────────────────
 
 
@@ -264,7 +293,6 @@ async def admin_get_user(
     user_id: str,
     auth: dict = Depends(_require_admin),
 ):
-    from .users import get_user
     user = get_user(_get_db(), user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

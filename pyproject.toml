@@ -160,6 +160,16 @@ termux-all = [
 ]
 dingtalk = ["dingtalk-stream==0.24.3", "alibabacloud-dingtalk==2.2.42", "qrcode==7.4.2"]
 feishu = ["lark-oapi==1.5.3", "qrcode==7.4.2"]
+# Multi-database backends for the Control Panel (AGENTOPS_DATABASE_URL).
+# SQLite is built-in (zero extra deps). Add mysql/postgresql for shared DB.
+mysql = ["pymysql==1.2.0", "DBUtils==3.1.2"]
+postgresql = ["psycopg2-binary==2.9.12", "DBUtils==3.1.2"]
+# Optional Redis cache for session tokens in multi-node deployments.
+redis = ["redis==5.3.1"]
+# Optional S3/MinIO file storage for multi-node deployments (agent file artifacts).
+s3 = ["minio>=7.2"]
+# Everything needed for a multi-node deployment (Agent + Control Panel).
+multi-node = ["hermes-agent[mysql]", "hermes-agent[postgresql]", "hermes-agent[redis]", "hermes-agent[s3]"]
 google = [
   # Required by the google-workspace skill (Gmail, Calendar, Drive, Contacts,
   # Sheets, Docs).  Declared here so packagers (Nix, Homebrew) ship them with

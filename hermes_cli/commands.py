@@ -119,6 +119,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
 
+    # Identity
+    CommandDef("bind", "Bind your chat identity to a Control Panel account", "Identity",
+               args_hint="[code]", gateway_only=True),
+
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
